@@ -1,3 +1,2 @@
-aiohttp
-playwright
-python-dotenv
+aiohttp>=3.9.0
+python-dotenv>=1.0.1
