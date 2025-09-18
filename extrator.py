@@ -1,24 +1,4 @@
 #!/usr/bin/env python3
-"""
-extrator.py - Extrator de rodadas (Playwright + hooks JS)
-
-Requisitos locais:
-  pip install playwright aiohttp python-dotenv
-  python -m playwright install chromium
-
-Variáveis de ambiente (Render / Docker):
-  DEBUG=true|false
-  GAME_URL=https://blaze.bet.br/pt/games/double
-  SUPABASE_ROUNDS_URL=...
-  SUPABASE_TOKEN=...
-  AWS_SIGNAL_URL=...      (opcional)
-  AWS_TOKEN=...           (opcional)
-  HISTORY_MAXLEN=2000
-  HEARTBEAT_SECS=60
-  USER_AGENT="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36"
-  PROXY=http://user:pass@host:port  (opcional)
-"""
-
 import os
 import json
 import asyncio
@@ -30,8 +10,7 @@ from typing import Deque, Dict, Any, List, Optional
 from playwright.async_api import async_playwright
 import aiohttp
 
-
-# ---------------- CONFIG (via environment) ----------------
+# ---------------- CONFIG ----------------
 GAME_URL = os.getenv("GAME_URL", "https://blaze.bet.br/pt/games/double")
 SUPABASE_ROUNDS_URL = os.getenv("SUPABASE_ROUNDS_URL", "")
 SUPABASE_TOKEN = os.getenv("SUPABASE_TOKEN", "")
@@ -42,22 +21,16 @@ HEARTBEAT_SECS = int(os.getenv("HEARTBEAT_SECS", "60"))
 USER_AGENT = os.getenv("USER_AGENT", "").strip()
 PROXY = os.getenv("PROXY", "").strip()
 DEBUG = os.getenv("DEBUG", "false").lower() in ("1", "true", "yes")
-
-# Dedupe em nível de Python
 _DEDUPE: set = set()
 _DEDUPE_MAX = int(os.getenv("DEDUPE_MAX", "4000"))
 
-
-# ---------------- Hook JS (injeta dentro da página) ----------------
-# Nota: se a Blaze trocar o nome do evento, ative DEBUG e olhe os [CONSOLE-RAW].
+# ---------------- HOOK JS ----------------
 HOOK_JS = r"""
 (() => {
   const COLORS = { 1: "red", 0: "white", 2: "black" };
   window.__emittedResults = window.__emittedResults || new Set();
 
   function tryEmitResult(obj) {
-    // Ajuste aqui se a Blaze mudar o envelope dos eventos:
-    //   - obj.id e obj.payload costumavam aparecer nos pacotes "data" do socket.io
     if (!obj || !obj.id || !obj.payload) return false;
 
     const isResult =
@@ -80,25 +53,21 @@ HOOK_JS = r"""
     if (window.__emittedResults.has(key)) return true;
     window.__emittedResults.add(key);
 
-    // Console é capturado pelo Playwright
     console.log("__RESULT__" + JSON.stringify({ roundId: rid, color, roll, at }));
     return true;
   }
 
   function parseSocketIoPacket(str) {
     if (typeof str !== "string") return;
-    // Socket.IO client text frames costumam começar com "42[...]"
     if (!str.startsWith("42")) return;
     try {
-      // Ex.: '42["data", {id: "double.result", payload: {...}}]'
-      const arr = JSON.parse(str.slice(2));
+      const arr = JSON.parse(str.slice(2)); // ["data", {...}]
       const eventName = arr?.[0];
       const body      = arr?.[1];
       if (eventName === "data") tryEmitResult(body);
-    } catch (e) {}
+    } catch {}
   }
 
-  // Hook fetch
   const _fetch = window.fetch;
   window.fetch = async function (...args) {
     const res = await _fetch.apply(this, args);
@@ -108,15 +77,13 @@ HOOK_JS = r"""
         const clone = res.clone();
         clone.text().then(text => {
           const parts = String(text || "").split("42[");
-          for (let i = 1; i < parts.length; i++)
-            parseSocketIoPacket("42[" + parts[i]);
-        }).catch(() => {});
+          for (let i = 1; i < parts.length; i++) parseSocketIoPacket("42[" + parts[i]);
+        }).catch(()=>{});
       }
-    } catch (e) {}
+    } catch {}
     return res;
   };
 
-  // Hook XHR
   const _open = XMLHttpRequest.prototype.open;
   const _send = XMLHttpRequest.prototype.send;
   XMLHttpRequest.prototype.open = function (method, url, ...rest) {
@@ -130,15 +97,13 @@ HOOK_JS = r"""
           const isText = (this.responseType === "" || this.responseType === "text");
           const text = isText ? (this.responseText || "") : "";
           const parts = String(text || "").split("42[");
-          for (let i = 1; i < parts.length; i++)
-            parseSocketIoPacket("42[" + parts[i]);
-        } catch (e) {}
+          for (let i = 1; i < parts.length; i++) parseSocketIoPacket("42[" + parts[i]);
+        } catch {}
       });
     }
     return _send.call(this, body);
   };
 
-  // Hook WebSocket
   const OriginalWS = window.WebSocket;
   window.WebSocket = function (url, protocols) {
     const ws = new OriginalWS(url, protocols);
@@ -150,7 +115,6 @@ HOOK_JS = r"""
 })();
 """
 
-
 # ---------------- utils ----------------
 def _evt_key(evt: Dict[str, Any]) -> str:
     rid = str(evt.get("roundId") or "")
@@ -158,7 +122,6 @@ def _evt_key(evt: Dict[str, Any]) -> str:
     at = str(evt.get("at") or "")
     base = f"{rid}|{roll}|{at}"
     return base if rid else hashlib.sha1(base.encode()).hexdigest()
-
 
 def _parse_occurred_at(at: Optional[str]) -> str:
     if not at:
@@ -172,12 +135,10 @@ def _parse_occurred_at(at: Optional[str]) -> str:
     except Exception:
         return datetime.now(timezone.utc).isoformat()
 
-
-# ---------------- envio supabase ----------------
+# ---------------- supabase ----------------
 async def send_to_supabase(session: aiohttp.ClientSession, evt: Dict[str, Any]) -> None:
     if not SUPABASE_ROUNDS_URL:
-        if DEBUG:
-            print("[SUPABASE] url vazia, pulando envio")
+        if DEBUG: print("[SUPABASE] url vazia, pulando envio")
         return
     payload = {
         "round_id": evt.get("roundId"),
@@ -201,11 +162,9 @@ async def send_to_supabase(session: aiohttp.ClientSession, evt: Dict[str, Any]) 
     except Exception as e:
         print(f"[SUPABASE] exception: {e}")
 
-
-# ---------------- estratégia (exemplo – personalize) ----------------
+# ---------------- estratégia (exemplo) ----------------
 def apply_strategies(history: Deque[Dict[str, Any]]) -> List[Dict[str, Any]]:
     signals: List[Dict[str, Any]] = []
-    # Exemplo simples: se "white" não aparece há mais de N rodadas
     N = 12
     last_white_idx = None
     for idx, r in reversed(list(enumerate(history))):
@@ -224,12 +183,10 @@ def apply_strategies(history: Deque[Dict[str, Any]]) -> List[Dict[str, Any]]:
             })
     return signals
 
-
-# ---------------- envio AWS (sinais) ----------------
+# ---------------- envio AWS (opcional) ----------------
 async def send_signals_to_aws(session: aiohttp.ClientSession, signals: List[Dict[str, Any]]) -> None:
     if not AWS_SIGNAL_URL or not signals:
-        if DEBUG and signals:
-            print("[AWS] url vazia, pulando envio")
+        if DEBUG and signals: print("[AWS] url vazia, pulando envio")
         return
     headers = {"Content-Type": "application/json"}
     if AWS_TOKEN:
@@ -245,11 +202,9 @@ async def send_signals_to_aws(session: aiohttp.ClientSession, signals: List[Dict
     except Exception as e:
         print(f"[AWS] exception: {e}")
 
-
 # ---------------- heartbeat ----------------
 async def heartbeat(history: Deque[Dict[str, Any]], stop_evt: asyncio.Event, interval: int):
-    if interval <= 0:
-        return
+    if interval <= 0: return
     last = -1
     while not stop_evt.is_set():
         await asyncio.sleep(interval)
@@ -259,6 +214,32 @@ async def heartbeat(history: Deque[Dict[str, Any]], stop_evt: asyncio.Event, int
             last = total
             print(f"[HEARTBEAT] rounds={total} red={counts.get('red',0)} black={counts.get('black',0)} white={counts.get('white',0)}")
 
+# ---------------- helpers ----------------
+async def bootstrap_page(page):
+    """Tenta aceitar cookies/garantir que o app inicializou antes do hook pegar eventos."""
+    # Alguns sites carregam banner de consentimento; tentamos clicar em botões comuns.
+    selectors = [
+        'button:has-text("Aceitar")',
+        'button:has-text("Accept")',
+        '[data-testid*="accept"]',
+        '[id*="accept"]',
+        '[class*="accept"]',
+    ]
+    for sel in selectors:
+        try:
+            btn = await page.query_selector(sel)
+            if btn:
+                await btn.click(force=True)
+                if DEBUG: print(f"[BOOTSTRAP] cliquei no consentimento via {sel}")
+                break
+        except:  # segue o jogo
+            pass
+
+    # Dá um fôlego pro app conectar sockets
+    try:
+        await page.wait_for_load_state("networkidle", timeout=30_000)
+    except:
+        pass
 
 # ---------------- main ----------------
 async def main():
@@ -268,7 +249,6 @@ async def main():
     timeout = aiohttp.ClientTimeout(total=None)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         async with async_playwright() as p:
-            # Flags compatíveis com container
             launch_kwargs = dict(
                 headless=True,
                 args=[
@@ -287,31 +267,40 @@ async def main():
             )
             if PROXY:
                 launch_kwargs["proxy"] = {"server": PROXY}
-
             if DEBUG:
                 print(f"[BOOT] launching chromium with: {launch_kwargs}")
 
             browser = await p.chromium.launch(**launch_kwargs)
 
-            context_args = {}
+            context_args = {
+                "timezone_id": "America/Fortaleza",
+                "locale": "pt-BR",
+            }
             if USER_AGENT:
                 context_args["user_agent"] = USER_AGENT
+
             ctx = await browser.new_context(**context_args)
             page = await ctx.new_page()
 
-            # ---------- console handler: logs RAW + __RESULT__ processing ----------
+            # ---- DEBUG: logs de rede/socket ----
+            if DEBUG:
+                page.on("request", lambda r: "/socket.io" in r.url and print(f"[NET] socket.io req -> {r.method} {r.url}"))
+                page.on("response", lambda r: "/socket.io" in r.url and print(f"[NET] socket.io resp -> {r.status} {r.url}"))
+
+                def ws_open(ws):
+                    print(f"[WS] open {ws.url}")
+                    ws.on("framereceived", lambda data: print(f"[WS-IN] {str(data)[:160]}"))
+                page.on("websocket", ws_open)
+
+            # ---- console handler (__RESULT__) ----
             async def on_console_msg(msg):
-                # Em algumas versões, msg.text é método; em outras, property.
                 try:
                     text = msg.text() if callable(getattr(msg, "text", None)) else msg.text
                 except Exception:
-                    try:
-                        text = msg.text()
-                    except Exception:
-                        text = "<unreadable-console-message>"
+                    try: text = msg.text()
+                    except Exception: text = "<unreadable-console-message>"
 
                 if DEBUG:
-                    # Vemos tudo do console quando DEBUG=true
                     print(f"[CONSOLE-RAW] {text}")
 
                 if not isinstance(text, str) or not text.startswith("__RESULT__"):
@@ -323,16 +312,13 @@ async def main():
                     print("[CONSOLE] __RESULT__ JSON parse failed")
                     return
 
-                # dedupe
                 key = _evt_key(evt)
                 if key in _DEDUPE:
-                    if DEBUG:
-                        print(f"[DEDUPE] skip {key}")
+                    if DEBUG: print(f"[DEDUPE] skip {key}")
                     return
                 _DEDUPE.add(key)
                 if len(_DEDUPE) > _DEDUPE_MAX:
-                    _DEDUPE.clear()
-                    _DEDUPE.add(key)
+                    _DEDUPE.clear(); _DEDUPE.add(key)
 
                 print(f"[RESULT] {evt.get('roundId')} -> {str(evt.get('color')).upper()} ({evt.get('roll')}) @ {evt.get('at') or ''}")
 
@@ -343,47 +329,29 @@ async def main():
                     "at": _parse_occurred_at(evt.get("at")),
                 })
 
-                # 1) Supabase
-                try:
-                    await send_to_supabase(session, evt)
-                except Exception as e:
-                    print(f"[SUPABASE] erro: {e}")
+                try: await send_to_supabase(session, evt)
+                except Exception as e: print(f"[SUPABASE] erro: {e}")
 
-                # 2) Estratégia + AWS
                 try:
                     signals = apply_strategies(history)
-                    if signals:
-                        await send_signals_to_aws(session, signals)
+                    if signals: await send_signals_to_aws(session, signals)
                 except Exception as e:
                     print(f"[AWS] erro sinais: {e}")
 
-            # Listener não-bloqueante
-            def console_listener(m):
-                asyncio.create_task(on_console_msg(m))
-            page.on("console", console_listener)
+            page.on("console", lambda m: asyncio.create_task(on_console_msg(m)))
 
-            # Opcional: bloquear assets pesados (mantém websocket/fetch)
-            if DEBUG:
-                async def _req_log(req):
-                    url = req.url
-                    if "/socket.io" in url:
-                        print(f"[NET] socket.io request -> {url}")
-                page.on("request", _req_log)
-
-            # Injeta o hook ANTES de navegar
+            # injeta hook antes de navegar
             await page.add_init_script(HOOK_JS)
 
-            # Navega (com retries) e espera a página se aquietar
+            # navega com reintentos + re-injeção do hook
             last_err = None
             for attempt in range(1, 4):
                 try:
-                    if DEBUG:
-                        print(f"[NAV] indo para {GAME_URL} (tentativa {attempt})")
+                    if DEBUG: print(f"[NAV] indo para {GAME_URL} (tentativa {attempt})")
                     await page.goto(GAME_URL, wait_until="domcontentloaded", timeout=45_000)
-                    # Re-injeta também após o domcontentloaded (alguns apps rebindam fetch/xhr)
+                    # re-injeta após o goto (alguns apps rebindam XHR/fetch)
                     await page.evaluate(HOOK_JS)
-                    # Dá um fôlego para o socket inicializar
-                    await page.wait_for_load_state("networkidle", timeout=30_000)
+                    await bootstrap_page(page)
                     break
                 except Exception as e:
                     last_err = e
@@ -391,7 +359,10 @@ async def main():
                     if attempt == 3:
                         raise last_err
 
-            # Heartbeat paralelo
+            # se qualquer frame navegar (apps SPA), re-injetamos o hook
+            page.on("framenavigated", lambda *_: asyncio.create_task(page.add_init_script(HOOK_JS)))
+
+            # heartbeat
             hb_task = asyncio.create_task(heartbeat(history, stop_evt, HEARTBEAT_SECS))
 
             print("Coletando RESULTADOS… (Ctrl+C para sair)")
@@ -402,16 +373,10 @@ async def main():
             finally:
                 stop_evt.set()
                 hb_task.cancel()
-                # Context/browse fecham ao sair do with/asyncio
-                try:
-                    await ctx.close()
-                except Exception:
-                    pass
-                try:
-                    await browser.close()
-                except Exception:
-                    pass
-
+                try: await ctx.close()
+                except: pass
+                try: await browser.close()
+                except: pass
 
 if __name__ == "__main__":
     try:
