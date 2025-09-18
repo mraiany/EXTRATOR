@@ -5,38 +5,37 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 
-# Dependências de sistema necessárias pro Chromium/Playwright
+# Dependências de sistema base; o `--with-deps` do Playwright completa o resto.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     wget \
     gnupg \
     libnss3 \
-    libatk1.0-0 \
     libatk-bridge2.0-0 \
-    libcups2 \
+    libgtk-3-0 \
     libdrm2 \
     libxkbcommon0 \
-    libx11-xcb1 \
-    libxcomposite1 \
     libxdamage1 \
+    libxcomposite1 \
     libxrandr2 \
     libgbm1 \
     libasound2 \
     libxshmfence1 \
     fonts-liberation \
-    && rm -rf /var/lib/apt/lists/*
+  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Se usa requirements.txt
+# 1) Instalar dependências Python (aproveita cache de build)
 COPY requirements.txt .
-RUN pip install -r requirements.txt || true
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Playwright + baixar Chromium com dependências
-RUN pip install playwright && playwright install --with-deps chromium
+# 2) Instalar Playwright e o Chromium com dependências do SO
+RUN pip install --no-cache-dir playwright \
+ && playwright install --with-deps chromium
 
-# Copia o projeto
+# 3) Copiar o projeto
 COPY . .
 
-# IMPORTANTE: -u (sem buffer) para os logs aparecerem no Render
+# IMPORTANTE: -u (unbuffered) para logs no Render
 CMD ["python", "-u", "extrator.py"]
