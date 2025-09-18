@@ -1,25 +1,42 @@
+# Dockerfile
 FROM python:3.11-slim
 
-# Instala dependências do sistema para rodar Chromium
-RUN apt-get update && apt-get install -y \
-    wget curl unzip gnupg \
-    libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
-    libdrm2 libxkbcommon0 libxcomposite1 libxrandr2 \
-    libgbm1 libasound2 libpangocairo-1.0-0 libpango-1.0-0 \
-    libxdamage1 libxfixes3 libatspi2.0-0 libgtk-3-0 \
-    fonts-liberation libappindicator3-1 \
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+
+# Dependências de sistema necessárias pro Chromium/Playwright
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    wget \
+    gnupg \
+    libnss3 \
+    libatk1.0-0 \
+    libatk-bridge2.0-0 \
+    libcups2 \
+    libdrm2 \
+    libxkbcommon0 \
+    libx11-xcb1 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxrandr2 \
+    libgbm1 \
+    libasound2 \
+    libxshmfence1 \
+    fonts-liberation \
     && rm -rf /var/lib/apt/lists/*
 
-# Instala Python deps
 WORKDIR /app
+
+# Se usa requirements.txt
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install -r requirements.txt || true
 
-# Instala navegadores do Playwright
-RUN playwright install --with-deps chromium
+# Playwright + baixar Chromium com dependências
+RUN pip install playwright && playwright install --with-deps chromium
 
-# Copia o código
+# Copia o projeto
 COPY . .
 
-# Comando padrão
-CMD ["python", "extrator.py"]
+# IMPORTANTE: -u (sem buffer) para os logs aparecerem no Render
+CMD ["python", "-u", "extrator.py"]
