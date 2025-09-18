@@ -1,97 +1,46 @@
-# extrator.py
-# -----------------------------------------------------------------------------
-# Coletor de resultados do Blaze Double usando Playwright (Chromium headless)
-#
-# Pronto para rodar em container (Render, Fly, Railway, etc.)
-#  - Chromium com flags: --no-sandbox, --disable-dev-shm-usage
-#  - Logs sem buffer (use python -u ou PYTHONUNBUFFERED=1)
-#
-# Requisitos:
-#   pip install playwright aiohttp python-dotenv (opcional)
-#   playwright install --with-deps chromium   # (no Dockerfile já fazemos isso)
-#
-# Variáveis de ambiente (exemplos):
-#   GAME_URL=https://blaze.bet.br/pt/games/double
-#   SUPABASE_ROUNDS_URL=https://<proj>.supabase.co/rest/v1/historico
-#   SUPABASE_TOKEN=eyJ...  (anon/service key se sua rota exigir)
-#   AWS_SIGNAL_URL=...     (opcional)
-#   AWS_TOKEN=...          (opcional)
-#   HISTORY_MAXLEN=2000
-#   HEARTBEAT_SECS=60
-#   USER_AGENT="Mozilla/5.0 ..."
-#   PROXY=http://user:pass@host:port (opcional)
-#   DEBUG=true
-# -----------------------------------------------------------------------------
+#!/usr/bin/env python3
+"""
+extrator.py - Extrator de rodadas (Playwright + hooks JS)
 
+Como usar (locally / container):
+  - pip install playwright aiohttp python-dotenv
+  - python -m playwright install chromium
+  - export DEBUG=true (opcional)
+  - python extrator.py
+
+Variáveis de ambiente:
+  GAME_URL, SUPABASE_ROUNDS_URL, SUPABASE_TOKEN,
+  AWS_SIGNAL_URL, AWS_TOKEN,
+  HISTORY_MAXLEN, HEARTBEAT_SECS, USER_AGENT, PROXY, DEBUG
+"""
 import os
 import json
 import asyncio
 import hashlib
-import signal
 from collections import deque, Counter
 from datetime import datetime, timezone
 from typing import Deque, Dict, Any, List, Optional
 
+from playwright.async_api import async_playwright
 import aiohttp
-from playwright.async_api import async_playwright, Page, ConsoleMessage
 
-# ========================== CONFIG ==========================================
+# ---------------- CONFIG (use env ou valores aqui) ----------------
+GAME_URL = os.getenv("GAME_URL", "https://blaze.bet.br/pt/games/double")
+SUPABASE_ROUNDS_URL = os.getenv("SUPABASE_ROUNDS_URL", "")
+SUPABASE_TOKEN = os.getenv("SUPABASE_TOKEN", "")
+AWS_SIGNAL_URL = os.getenv("AWS_SIGNAL_URL", "")
+AWS_TOKEN = os.getenv("AWS_TOKEN", "")
+HISTORY_MAXLEN = int(os.getenv("HISTORY_MAXLEN", "2000"))
+HEARTBEAT_SECS = int(os.getenv("HEARTBEAT_SECS", "60"))
+USER_AGENT = os.getenv("USER_AGENT", "").strip()
+PROXY = os.getenv("PROXY", "").strip()
+DEBUG = os.getenv("DEBUG", "false").lower() in ("1", "true", "yes")
 
-CONFIG = {
-    # Use variáveis de ambiente por padrão em produção
-    "USE_ENV": True,
-
-    # Defaults (caso a env não esteja definida)
-    "GAME_URL": "https://blaze.bet.br/pt/games/double",
-    "SUPABASE_ROUNDS_URL": "",
-    "SUPABASE_TOKEN": "",
-    "AWS_SIGNAL_URL": "",
-    "AWS_TOKEN": "",
-    "HISTORY_MAXLEN": 2000,
-    "HEARTBEAT_SECS": 60,
-    "USER_AGENT": "",
-    "PROXY": "",
-    "DEBUG": False,
-}
-
-def _get_cfg():
-    if CONFIG["USE_ENV"]:
-        return {
-            "GAME_URL": os.getenv("GAME_URL", CONFIG["GAME_URL"]),
-            "SUPABASE_ROUNDS_URL": os.getenv("SUPABASE_ROUNDS_URL", CONFIG["SUPABASE_ROUNDS_URL"]),
-            "SUPABASE_TOKEN": os.getenv("SUPABASE_TOKEN", CONFIG["SUPABASE_TOKEN"]),
-            "AWS_SIGNAL_URL": os.getenv("AWS_SIGNAL_URL", CONFIG["AWS_SIGNAL_URL"]),
-            "AWS_TOKEN": os.getenv("AWS_TOKEN", CONFIG["AWS_TOKEN"]),
-            "HISTORY_MAXLEN": int(os.getenv("HISTORY_MAXLEN", str(CONFIG["HISTORY_MAXLEN"]))),
-            "HEARTBEAT_SECS": int(os.getenv("HEARTBEAT_SECS", str(CONFIG["HEARTBEAT_SECS"]))),
-            "USER_AGENT": os.getenv("USER_AGENT", CONFIG["USER_AGENT"]).strip(),
-            "PROXY": os.getenv("PROXY", CONFIG["PROXY"]).strip(),
-            "DEBUG": os.getenv("DEBUG", str(CONFIG["DEBUG"])).lower() in ("1", "true", "yes"),
-        }
-    return {
-        k: (v.strip() if isinstance(v, str) else v)
-        for k, v in CONFIG.items()
-        if k != "USE_ENV"
-    }
-
-CFG = _get_cfg()
-GAME_URL = CFG["GAME_URL"]
-SUPABASE_ROUNDS_URL = CFG["SUPABASE_ROUNDS_URL"]
-SUPABASE_TOKEN = CFG["SUPABASE_TOKEN"]
-AWS_SIGNAL_URL = CFG["AWS_SIGNAL_URL"]
-AWS_TOKEN = CFG["AWS_TOKEN"]
-HISTORY_MAXLEN = CFG["HISTORY_MAXLEN"]
-HEARTBEAT_SECS = CFG["HEARTBEAT_SECS"]
-USER_AGENT = CFG["USER_AGENT"]
-PROXY = CFG["PROXY"]
-DEBUG = CFG["DEBUG"]
-
-# Dedupe em nível de Python
+# dedupe em nível de Python
 _DEDUPE: set = set()
-_DEDUPE_MAX = 4000
+_DEDUPE_MAX = int(os.getenv("DEDUPE_MAX", "4000"))
 
-# ========================== HOOK (JS) =======================================
-
+# ---------------- Hook JS (injeta dentro da página) ----------------
 HOOK_JS = r"""
 (() => {
   const COLORS = { 1: "red", 0: "white", 2: "black" };
@@ -120,22 +69,23 @@ HOOK_JS = r"""
     if (window.__emittedResults.has(key)) return true;
     window.__emittedResults.add(key);
 
+    // envia para console (capturado pelo Playwright)
     console.log("__RESULT__" + JSON.stringify({ roundId: rid, color, roll, at }));
     return true;
   }
 
   function parseSocketIoPacket(str) {
     if (typeof str !== "string") return;
-    if (!str.startsWith("42")) return; // socket.io
+    if (!str.startsWith("42")) return; // socket.io evento
     try {
       const arr = JSON.parse(str.slice(2)); // ["data", {...}]
       const eventName = arr?.[0];
       const body      = arr?.[1];
       if (eventName === "data") tryEmitResult(body);
-    } catch {}
+    } catch (e) {}
   }
 
-  // fetch
+  // Hook fetch
   const _fetch = window.fetch;
   window.fetch = async function (...args) {
     const res = await _fetch.apply(this, args);
@@ -148,11 +98,11 @@ HOOK_JS = r"""
           for (let i = 1; i < parts.length; i++) parseSocketIoPacket("42[" + parts[i]);
         }).catch(() => {});
       }
-    } catch {}
+    } catch (e) {}
     return res;
   };
 
-  // XHR
+  // Hook XHR
   const _open = XMLHttpRequest.prototype.open;
   const _send = XMLHttpRequest.prototype.send;
   XMLHttpRequest.prototype.open = function (method, url, ...rest) {
@@ -166,13 +116,13 @@ HOOK_JS = r"""
           const text = (this.responseType === "" || this.responseType === "text") ? (this.responseText || "") : "";
           const parts = String(text || "").split("42[");
           for (let i = 1; i < parts.length; i++) parseSocketIoPacket("42[" + parts[i]);
-        } catch {}
+        } catch (e) {}
       });
     }
     return _send.call(this, body);
   };
 
-  // WebSocket
+  // Hook WebSocket
   const OriginalWS = window.WebSocket;
   window.WebSocket = function (url, protocols) {
     const ws = new OriginalWS(url, protocols);
@@ -184,14 +134,14 @@ HOOK_JS = r"""
 })();
 """
 
-# ========================== UTILS ===========================================
-
+# ---------------- utils ----------------
 def _evt_key(evt: Dict[str, Any]) -> str:
-    rid  = str(evt.get("roundId") or "")
+    rid = str(evt.get("roundId") or "")
     roll = str(evt.get("roll") or "")
-    at   = str(evt.get("at") or "")
+    at = str(evt.get("at") or "")
     base = f"{rid}|{roll}|{at}"
     return base if rid else hashlib.sha1(base.encode()).hexdigest()
+
 
 def _parse_occurred_at(at: Optional[str]) -> str:
     if not at:
@@ -205,18 +155,17 @@ def _parse_occurred_at(at: Optional[str]) -> str:
     except Exception:
         return datetime.now(timezone.utc).isoformat()
 
-# ========================== ENVIO: Supabase =================================
 
+# ---------------- envio supabase ----------------
 async def send_to_supabase(session: aiohttp.ClientSession, evt: Dict[str, Any]) -> None:
     if not SUPABASE_ROUNDS_URL:
         if DEBUG:
-            print("[SUPABASE] URL não definida — pulando envio", flush=True)
+            print("[SUPABASE] url vazia, pulando envio")
         return
-
     payload = {
-        "round_id":   evt.get("roundId"),
-        "color":      evt.get("color"),
-        "roll":       evt.get("roll"),
+        "round_id": evt.get("roundId"),
+        "color": evt.get("color"),
+        "roll": evt.get("roll"),
         "occurred_at": _parse_occurred_at(evt.get("at")),
         "ingested_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -225,30 +174,22 @@ async def send_to_supabase(session: aiohttp.ClientSession, evt: Dict[str, Any]) 
         headers["apikey"] = SUPABASE_TOKEN
         headers["Authorization"] = f"Bearer {SUPABASE_TOKEN}"
         headers["Prefer"] = "resolution=merge-duplicates"
+    try:
+        async with session.post(SUPABASE_ROUNDS_URL, headers=headers, json=payload) as resp:
+            body = await resp.text()
+            if resp.status >= 400:
+                print(f"[SUPABASE] {resp.status}: {body[:240]}")
+            else:
+                if DEBUG:
+                    print(f"[SUPABASE][ok] {resp.status} body={body[:240]}")
+    except Exception as e:
+        print(f"[SUPABASE] exception: {e}")
 
-    if DEBUG:
-        try:
-            print(f"[SUPABASE][DEBUG] POST {SUPABASE_ROUNDS_URL} payload={json.dumps(payload)}", flush=True)
-        except Exception:
-            print("[SUPABASE][DEBUG] payload não serializável", flush=True)
 
-    async with session.post(SUPABASE_ROUNDS_URL, headers=headers, json=payload) as resp:
-        body = await resp.text()
-        if resp.status >= 400:
-            print(f"[SUPABASE] {resp.status}: {body[:240]}", flush=True)
-        elif DEBUG:
-            print(f"[SUPABASE][DEBUG] {resp.status}: {body[:240]}", flush=True)
-
-# ========================== REGRAS / SINAIS =================================
-
+# ---------------- estratégia (ponto de customização) ----------------
 def apply_strategies(history: Deque[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    PONTO ÚNICO para suas REGRAS DE NEGÓCIO
-    Retorne sinais no formato sugerido abaixo, se quiser.
-    """
     signals: List[Dict[str, Any]] = []
-
-    # Exemplo: se "white" não aparece há mais de N rodadas → sinal
+    # Exemplo simples (você substitui pela sua lógica)
     N = 12
     last_white_idx = None
     for idx, r in reversed(list(enumerate(history))):
@@ -263,180 +204,187 @@ def apply_strategies(history: Deque[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "target": "white",
                 "stake": 1,
                 "reason": f"anti-streak-white>{N}",
-                "ts": datetime.now(timezone.utc).isoformat(),
+                "ts": datetime.now(timezone.utc).isoformat()
             })
-
     return signals
 
-# ========================== ENVIO: AWS (opcional) ===========================
 
+# ---------------- envio AWS (sinais) ----------------
 async def send_signals_to_aws(session: aiohttp.ClientSession, signals: List[Dict[str, Any]]) -> None:
     if not AWS_SIGNAL_URL or not signals:
+        if DEBUG and signals:
+            print("[AWS] url vazia, pulando envio")
         return
     headers = {"Content-Type": "application/json"}
     if AWS_TOKEN:
         headers["Authorization"] = f"Bearer {AWS_TOKEN}"
     payload = {"signals": signals}
-    async with session.post(AWS_SIGNAL_URL, headers=headers, json=payload) as resp:
-        if resp.status >= 400:
-            body = await resp.text()
-            print(f"[AWS] {resp.status}: {body[:240]}", flush=True)
+    try:
+        async with session.post(AWS_SIGNAL_URL, headers=headers, json=payload) as resp:
+            if resp.status >= 400:
+                body = await resp.text()
+                print(f"[AWS] {resp.status}: {body[:240]}")
+            else:
+                if DEBUG:
+                    print(f"[AWS] ok {resp.status}")
+    except Exception as e:
+        print(f"[AWS] exception: {e}")
 
-# ========================== HEARTBEAT =======================================
 
+# ---------------- heartbeat ----------------
 async def heartbeat(history: Deque[Dict[str, Any]], stop_evt: asyncio.Event, interval: int):
     if interval <= 0:
         return
+    last = -1
     while not stop_evt.is_set():
         await asyncio.sleep(interval)
         counts = Counter([r.get("color") for r in history])
         total = len(history)
-        print(
-            f"[HEARTBEAT] rounds={total} red={counts.get('red',0)} "
-            f"black={counts.get('black',0)} white={counts.get('white',0)}",
-            flush=True
-        )
+        if total != last or DEBUG:
+            last = total
+            print(f"[HEARTBEAT] rounds={total} red={counts.get('red',0)} black={counts.get('black',0)} white={counts.get('white',0)}")
 
-# ========================== MAIN ============================================
 
-async def _run() -> None:
-    print("[BOOT] extrator starting...", flush=True)
-    print(f"[BOOT] GAME_URL={GAME_URL}", flush=True)
-
+# ---------------- main ----------------
+async def main():
     history: Deque[Dict[str, Any]] = deque(maxlen=HISTORY_MAXLEN)
     stop_evt = asyncio.Event()
-
-    # Respeitar SIGTERM/SIGINT (plataformas de nuvem)
-    def _graceful(*_a):
-        try:
-            stop_evt.set()
-        except Exception:
-            pass
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        try:
-            asyncio.get_running_loop().add_signal_handler(sig, _graceful)
-        except NotImplementedError:
-            # Windows ou ambientes sem suporte
-            pass
 
     timeout = aiohttp.ClientTimeout(total=None)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         async with async_playwright() as p:
-            launch_kwargs = {
-                "headless": True,
-                "args": [
+            # Launch options - flags para maximizar compatibilidade em containers/headless
+            launch_kwargs = dict(
+                headless=True,
+                args=[
                     "--no-sandbox",
                     "--disable-setuid-sandbox",
                     "--disable-dev-shm-usage",
                     "--disable-gpu",
+                    "--disable-software-rasterizer",
+                    "--mute-audio",
+                    "--disable-extensions",
+                    "--disable-background-networking",
+                    "--disable-background-timer-throttling",
+                    "--disable-renderer-backgrounding",
+                    "--disable-ipc-flooding-protection",
                 ],
-            }
+            )
             if PROXY:
                 launch_kwargs["proxy"] = {"server": PROXY}
 
-            print("[BOOT] launching chromium with:", launch_kwargs, flush=True)
+            if DEBUG:
+                print(f"[BOOT] launching chromium with: headless={launch_kwargs.get('headless')} args={launch_kwargs.get('args')[:5]} ...")
             browser = await p.chromium.launch(**launch_kwargs)
 
             context_args = {}
             if USER_AGENT:
                 context_args["user_agent"] = USER_AGENT
             ctx = await browser.new_context(**context_args)
-            page: Page = await ctx.new_page()
+            page = await ctx.new_page()
 
-            # Handler de console (usando .text como PROPRIEDADE)
-            async def on_console(msg: ConsoleMessage):
+            # ---------- console handler: logs RAW + __RESULT__ processing ----------
+            async def on_console_msg(msg):
+                # msg.text may be property or callable depending on version; handle ambos
                 try:
-                    text = msg.text
-                    if not isinstance(text, str) or not text.startswith("__RESULT__"):
-                        return
-
+                    text = msg.text() if callable(getattr(msg, "text", None)) else msg.text
+                except Exception:
                     try:
-                        evt = json.loads(text[len("__RESULT__"):])
+                        text = msg.text()
                     except Exception:
-                        return
+                        text = "<unreadable-console-message>"
 
-                    # Dedupe
-                    key = _evt_key(evt)
-                    if key in _DEDUPE:
-                        return
+                # raw console for debugging
+                print(f"[CONSOLE-RAW] {text}")
+
+                if not isinstance(text, str):
+                    return
+
+                if not text.startswith("__RESULT__"):
+                    return
+
+                try:
+                    evt = json.loads(text[len("__RESULT__"):])
+                except Exception:
+                    print("[CONSOLE] __RESULT__ JSON parse failed")
+                    return
+
+                # dedupe python
+                key = _evt_key(evt)
+                if key in _DEDUPE:
+                    if DEBUG:
+                        print(f"[DEDUPE] skip {key}")
+                    return
+                _DEDUPE.add(key)
+                if len(_DEDUPE) > _DEDUPE_MAX:
+                    _DEDUPE.clear()
                     _DEDUPE.add(key)
-                    if len(_DEDUPE) > _DEDUPE_MAX:
-                        _DEDUPE.clear()
-                        _DEDUPE.add(key)
 
-                    print(
-                        f"[RESULT] {evt.get('roundId')} -> {str(evt.get('color')).upper()} "
-                        f"({evt.get('roll')}) @ {evt.get('at') or ''}",
-                        flush=True
-                    )
+                # log e armazena histórico
+                print(f"[RESULT] {evt.get('roundId')} -> {str(evt.get('color')).upper()} ({evt.get('roll')}) @ {evt.get('at') or ''}")
 
-                    # Atualiza histórico
-                    history.append({
-                        "roundId": evt.get("roundId"),
-                        "color":   evt.get("color"),
-                        "roll":    evt.get("roll"),
-                        "at":      _parse_occurred_at(evt.get("at")),
-                    })
+                history.append({
+                    "roundId": evt.get("roundId"),
+                    "color": evt.get("color"),
+                    "roll": evt.get("roll"),
+                    "at": _parse_occurred_at(evt.get("at")),
+                })
 
-                    # Envio Supabase
-                    try:
-                        await send_to_supabase(session, evt)
-                    except Exception as e:
-                        print(f"[SUPABASE] erro: {e}", flush=True)
-
-                    # Estratégias + AWS
-                    try:
-                        signals = apply_strategies(history)
-                        if signals:
-                            await send_signals_to_aws(session, signals)
-                    except Exception as e:
-                        print(f"[AWS] erro sinais: {e}", flush=True)
-
+                # 1) envia ao Supabase
+                try:
+                    await send_to_supabase(session, evt)
                 except Exception as e:
-                    print(f"[CONSOLE] handler error: {e}", flush=True)
+                    print(f"[SUPABASE] erro: {e}")
 
-            # Listener não bloqueante
-            def console_listener(m: ConsoleMessage):
-                asyncio.create_task(on_console(m))
+                # 2) gera sinais e envia para AWS (se houver)
+                try:
+                    signals = apply_strategies(history)
+                    if signals:
+                        await send_signals_to_aws(session, signals)
+                except Exception as e:
+                    print(f"[AWS] erro sinais: {e}")
 
+            # listener wrapper para não bloquear
+            def console_listener(m):
+                asyncio.create_task(on_console_msg(m))
             page.on("console", console_listener)
+
+            # evita logs ruidosos de fechamento
             page.on("close", lambda *a, **k: None)
 
-            # Injeta hook antes de navegar
+            # injeta hook ANTES de navegar
             await page.add_init_script(HOOK_JS)
 
-            # Navegação com retry simples
+            # tenta navegar com retries
             for attempt in range(3):
                 try:
-                    print(f"[NAV] indo para {GAME_URL} (tentativa {attempt+1})", flush=True)
+                    if DEBUG:
+                        print(f"[NAV] indo para {GAME_URL} (tentativa {attempt+1})")
                     await page.goto(GAME_URL, wait_until="domcontentloaded", timeout=45_000)
                     break
                 except Exception as e:
-                    print(f"[NAV] tentativa {attempt+1} falhou: {e}", flush=True)
+                    print(f"[NAV] tentativa {attempt+1} falhou: {e}")
                     if attempt == 2:
                         raise
 
-            # Heartbeat paralelo
+            # start heartbeat
             hb_task = asyncio.create_task(heartbeat(history, stop_evt, HEARTBEAT_SECS))
 
-            print("Coletando RESULTADOS… (Ctrl+C para sair)", flush=True)
+            print("Coletando RESULTADOS… (Ctrl+C para sair)")
             try:
-                # Espera até sinal de término
-                await stop_evt.wait()
+                await asyncio.Event().wait()
+            except (KeyboardInterrupt, SystemExit):
+                pass
             finally:
+                stop_evt.set()
                 hb_task.cancel()
-                try:
-                    await ctx.close()
-                except Exception:
-                    pass
-                try:
-                    await browser.close()
-                except Exception:
-                    pass
-                print("[SHUTDOWN] finalizado.", flush=True)
-
-def main():
-    asyncio.run(_run())
+                # o context manager fecha o browser com segurança
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("Interrompido pelo usuário")
+    except Exception as e:
+        print(f"[FATAL] {e}")
+        raise
