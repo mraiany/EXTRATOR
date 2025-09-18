@@ -2,17 +2,23 @@
 """
 extrator.py - Extrator de rodadas (Playwright + hooks JS)
 
-Como usar (locally / container):
-  - pip install playwright aiohttp python-dotenv
-  - python -m playwright install chromium
-  - export DEBUG=true (opcional)
-  - python extrator.py
+Requisitos locais:
+  pip install playwright aiohttp python-dotenv
+  python -m playwright install chromium
 
-Variáveis de ambiente:
-  GAME_URL, SUPABASE_ROUNDS_URL, SUPABASE_TOKEN,
-  AWS_SIGNAL_URL, AWS_TOKEN,
-  HISTORY_MAXLEN, HEARTBEAT_SECS, USER_AGENT, PROXY, DEBUG
+Variáveis de ambiente (Render / Docker):
+  DEBUG=true|false
+  GAME_URL=https://blaze.bet.br/pt/games/double
+  SUPABASE_ROUNDS_URL=...
+  SUPABASE_TOKEN=...
+  AWS_SIGNAL_URL=...      (opcional)
+  AWS_TOKEN=...           (opcional)
+  HISTORY_MAXLEN=2000
+  HEARTBEAT_SECS=60
+  USER_AGENT="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36"
+  PROXY=http://user:pass@host:port  (opcional)
 """
+
 import os
 import json
 import asyncio
@@ -24,7 +30,8 @@ from typing import Deque, Dict, Any, List, Optional
 from playwright.async_api import async_playwright
 import aiohttp
 
-# ---------------- CONFIG (use env ou valores aqui) ----------------
+
+# ---------------- CONFIG (via environment) ----------------
 GAME_URL = os.getenv("GAME_URL", "https://blaze.bet.br/pt/games/double")
 SUPABASE_ROUNDS_URL = os.getenv("SUPABASE_ROUNDS_URL", "")
 SUPABASE_TOKEN = os.getenv("SUPABASE_TOKEN", "")
@@ -36,17 +43,21 @@ USER_AGENT = os.getenv("USER_AGENT", "").strip()
 PROXY = os.getenv("PROXY", "").strip()
 DEBUG = os.getenv("DEBUG", "false").lower() in ("1", "true", "yes")
 
-# dedupe em nível de Python
+# Dedupe em nível de Python
 _DEDUPE: set = set()
 _DEDUPE_MAX = int(os.getenv("DEDUPE_MAX", "4000"))
 
+
 # ---------------- Hook JS (injeta dentro da página) ----------------
+# Nota: se a Blaze trocar o nome do evento, ative DEBUG e olhe os [CONSOLE-RAW].
 HOOK_JS = r"""
 (() => {
   const COLORS = { 1: "red", 0: "white", 2: "black" };
   window.__emittedResults = window.__emittedResults || new Set();
 
   function tryEmitResult(obj) {
+    // Ajuste aqui se a Blaze mudar o envelope dos eventos:
+    //   - obj.id e obj.payload costumavam aparecer nos pacotes "data" do socket.io
     if (!obj || !obj.id || !obj.payload) return false;
 
     const isResult =
@@ -69,16 +80,18 @@ HOOK_JS = r"""
     if (window.__emittedResults.has(key)) return true;
     window.__emittedResults.add(key);
 
-    // envia para console (capturado pelo Playwright)
+    // Console é capturado pelo Playwright
     console.log("__RESULT__" + JSON.stringify({ roundId: rid, color, roll, at }));
     return true;
   }
 
   function parseSocketIoPacket(str) {
     if (typeof str !== "string") return;
-    if (!str.startsWith("42")) return; // socket.io evento
+    // Socket.IO client text frames costumam começar com "42[...]"
+    if (!str.startsWith("42")) return;
     try {
-      const arr = JSON.parse(str.slice(2)); // ["data", {...}]
+      // Ex.: '42["data", {id: "double.result", payload: {...}}]'
+      const arr = JSON.parse(str.slice(2));
       const eventName = arr?.[0];
       const body      = arr?.[1];
       if (eventName === "data") tryEmitResult(body);
@@ -95,7 +108,8 @@ HOOK_JS = r"""
         const clone = res.clone();
         clone.text().then(text => {
           const parts = String(text || "").split("42[");
-          for (let i = 1; i < parts.length; i++) parseSocketIoPacket("42[" + parts[i]);
+          for (let i = 1; i < parts.length; i++)
+            parseSocketIoPacket("42[" + parts[i]);
         }).catch(() => {});
       }
     } catch (e) {}
@@ -113,9 +127,11 @@ HOOK_JS = r"""
     if (this.__isSock) {
       this.addEventListener("load", function () {
         try {
-          const text = (this.responseType === "" || this.responseType === "text") ? (this.responseText || "") : "";
+          const isText = (this.responseType === "" || this.responseType === "text");
+          const text = isText ? (this.responseText || "") : "";
           const parts = String(text || "").split("42[");
-          for (let i = 1; i < parts.length; i++) parseSocketIoPacket("42[" + parts[i]);
+          for (let i = 1; i < parts.length; i++)
+            parseSocketIoPacket("42[" + parts[i]);
         } catch (e) {}
       });
     }
@@ -133,6 +149,7 @@ HOOK_JS = r"""
   };
 })();
 """
+
 
 # ---------------- utils ----------------
 def _evt_key(evt: Dict[str, Any]) -> str:
@@ -179,17 +196,16 @@ async def send_to_supabase(session: aiohttp.ClientSession, evt: Dict[str, Any]) 
             body = await resp.text()
             if resp.status >= 400:
                 print(f"[SUPABASE] {resp.status}: {body[:240]}")
-            else:
-                if DEBUG:
-                    print(f"[SUPABASE][ok] {resp.status} body={body[:240]}")
+            elif DEBUG:
+                print(f"[SUPABASE][ok] {resp.status} body={body[:240]}")
     except Exception as e:
         print(f"[SUPABASE] exception: {e}")
 
 
-# ---------------- estratégia (ponto de customização) ----------------
+# ---------------- estratégia (exemplo – personalize) ----------------
 def apply_strategies(history: Deque[Dict[str, Any]]) -> List[Dict[str, Any]]:
     signals: List[Dict[str, Any]] = []
-    # Exemplo simples (você substitui pela sua lógica)
+    # Exemplo simples: se "white" não aparece há mais de N rodadas
     N = 12
     last_white_idx = None
     for idx, r in reversed(list(enumerate(history))):
@@ -224,9 +240,8 @@ async def send_signals_to_aws(session: aiohttp.ClientSession, signals: List[Dict
             if resp.status >= 400:
                 body = await resp.text()
                 print(f"[AWS] {resp.status}: {body[:240]}")
-            else:
-                if DEBUG:
-                    print(f"[AWS] ok {resp.status}")
+            elif DEBUG:
+                print(f"[AWS] ok {resp.status}")
     except Exception as e:
         print(f"[AWS] exception: {e}")
 
@@ -253,7 +268,7 @@ async def main():
     timeout = aiohttp.ClientTimeout(total=None)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         async with async_playwright() as p:
-            # Launch options - flags para maximizar compatibilidade em containers/headless
+            # Flags compatíveis com container
             launch_kwargs = dict(
                 headless=True,
                 args=[
@@ -274,7 +289,8 @@ async def main():
                 launch_kwargs["proxy"] = {"server": PROXY}
 
             if DEBUG:
-                print(f"[BOOT] launching chromium with: headless={launch_kwargs.get('headless')} args={launch_kwargs.get('args')[:5]} ...")
+                print(f"[BOOT] launching chromium with: {launch_kwargs}")
+
             browser = await p.chromium.launch(**launch_kwargs)
 
             context_args = {}
@@ -285,7 +301,7 @@ async def main():
 
             # ---------- console handler: logs RAW + __RESULT__ processing ----------
             async def on_console_msg(msg):
-                # msg.text may be property or callable depending on version; handle ambos
+                # Em algumas versões, msg.text é método; em outras, property.
                 try:
                     text = msg.text() if callable(getattr(msg, "text", None)) else msg.text
                 except Exception:
@@ -294,13 +310,11 @@ async def main():
                     except Exception:
                         text = "<unreadable-console-message>"
 
-                # raw console for debugging
-                print(f"[CONSOLE-RAW] {text}")
+                if DEBUG:
+                    # Vemos tudo do console quando DEBUG=true
+                    print(f"[CONSOLE-RAW] {text}")
 
-                if not isinstance(text, str):
-                    return
-
-                if not text.startswith("__RESULT__"):
+                if not isinstance(text, str) or not text.startswith("__RESULT__"):
                     return
 
                 try:
@@ -309,7 +323,7 @@ async def main():
                     print("[CONSOLE] __RESULT__ JSON parse failed")
                     return
 
-                # dedupe python
+                # dedupe
                 key = _evt_key(evt)
                 if key in _DEDUPE:
                     if DEBUG:
@@ -320,7 +334,6 @@ async def main():
                     _DEDUPE.clear()
                     _DEDUPE.add(key)
 
-                # log e armazena histórico
                 print(f"[RESULT] {evt.get('roundId')} -> {str(evt.get('color')).upper()} ({evt.get('roll')}) @ {evt.get('at') or ''}")
 
                 history.append({
@@ -330,13 +343,13 @@ async def main():
                     "at": _parse_occurred_at(evt.get("at")),
                 })
 
-                # 1) envia ao Supabase
+                # 1) Supabase
                 try:
                     await send_to_supabase(session, evt)
                 except Exception as e:
                     print(f"[SUPABASE] erro: {e}")
 
-                # 2) gera sinais e envia para AWS (se houver)
+                # 2) Estratégia + AWS
                 try:
                     signals = apply_strategies(history)
                     if signals:
@@ -344,30 +357,41 @@ async def main():
                 except Exception as e:
                     print(f"[AWS] erro sinais: {e}")
 
-            # listener wrapper para não bloquear
+            # Listener não-bloqueante
             def console_listener(m):
                 asyncio.create_task(on_console_msg(m))
             page.on("console", console_listener)
 
-            # evita logs ruidosos de fechamento
-            page.on("close", lambda *a, **k: None)
+            # Opcional: bloquear assets pesados (mantém websocket/fetch)
+            if DEBUG:
+                async def _req_log(req):
+                    url = req.url
+                    if "/socket.io" in url:
+                        print(f"[NET] socket.io request -> {url}")
+                page.on("request", _req_log)
 
-            # injeta hook ANTES de navegar
+            # Injeta o hook ANTES de navegar
             await page.add_init_script(HOOK_JS)
 
-            # tenta navegar com retries
-            for attempt in range(3):
+            # Navega (com retries) e espera a página se aquietar
+            last_err = None
+            for attempt in range(1, 4):
                 try:
                     if DEBUG:
-                        print(f"[NAV] indo para {GAME_URL} (tentativa {attempt+1})")
+                        print(f"[NAV] indo para {GAME_URL} (tentativa {attempt})")
                     await page.goto(GAME_URL, wait_until="domcontentloaded", timeout=45_000)
+                    # Re-injeta também após o domcontentloaded (alguns apps rebindam fetch/xhr)
+                    await page.evaluate(HOOK_JS)
+                    # Dá um fôlego para o socket inicializar
+                    await page.wait_for_load_state("networkidle", timeout=30_000)
                     break
                 except Exception as e:
-                    print(f"[NAV] tentativa {attempt+1} falhou: {e}")
-                    if attempt == 2:
-                        raise
+                    last_err = e
+                    print(f"[NAV] tentativa {attempt} falhou: {e}")
+                    if attempt == 3:
+                        raise last_err
 
-            # start heartbeat
+            # Heartbeat paralelo
             hb_task = asyncio.create_task(heartbeat(history, stop_evt, HEARTBEAT_SECS))
 
             print("Coletando RESULTADOS… (Ctrl+C para sair)")
@@ -378,7 +402,16 @@ async def main():
             finally:
                 stop_evt.set()
                 hb_task.cancel()
-                # o context manager fecha o browser com segurança
+                # Context/browse fecham ao sair do with/asyncio
+                try:
+                    await ctx.close()
+                except Exception:
+                    pass
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+
 
 if __name__ == "__main__":
     try:
