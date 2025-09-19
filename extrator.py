@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
-Extrator de rodadas – Selenium + Selenium-Wire (com SOCKS5/HTTP)
-Correções de timeout do renderer:
-  - pageLoadStrategy = "eager"
-  - set_page_load_timeout + try/except e continuação
+Extrator de rodadas – Selenium + Selenium-Wire
+- Headless ajustável por variável de ambiente (HEADLESS)
+- Logs estratégicos para diagnóstico
+- Compatibilidade PROXY_URL / PROXY
+- Amostra de console e estado do DOM
+- Hook JS para interceptar socket.io (fetch/XHR/WebSocket)
 """
 
 import os
@@ -21,23 +23,46 @@ from selenium.webdriver.chrome.options import Options
 from selenium.common.exceptions import TimeoutException, WebDriverException
 
 # ---------- ENV ----------
-GAME_URL = os.getenv("GAME_URL", "https://blaze.bet.br/pt/games/double")
-SUPABASE_ROUNDS_URL = os.getenv("SUPABASE_ROUNDS_URL", "")
-SUPABASE_TOKEN = os.getenv("SUPABASE_TOKEN", "")
+GAME_URL = os.getenv("GAME_URL", "https://blaze.bet.br/pt/games/double").strip()
+SUPABASE_ROUNDS_URL = os.getenv("SUPABASE_ROUNDS_URL", "").strip()
+SUPABASE_TOKEN = os.getenv("SUPABASE_TOKEN", "").strip()
 USER_AGENT = os.getenv("USER_AGENT", "").strip()
-PROXY_URL = os.getenv("PROXY_URL", "").strip()
+
+# HEADLESS: "chrome" (recomendado), "new", "off"
+HEADLESS = os.getenv("HEADLESS", "chrome").strip().lower()
+
+# Proxy compat: aceita PROXY_URL (novo) ou PROXY (legado)
+PROXY_URL = (os.getenv("PROXY_URL") or os.getenv("PROXY") or "").strip()
+
 HISTORY_MAXLEN = int(os.getenv("HISTORY_MAXLEN", "2000"))
 HEARTBEAT_SECS = int(os.getenv("HEARTBEAT_SECS", "60"))
 DEBUG = os.getenv("DEBUG", "false").lower() in ("1", "true", "yes")
 
+# Inspeção de rede (apenas logs) – cuidado com volume
+DEBUG_SOCKET = os.getenv("DEBUG_SOCKET", "false").lower() in ("1", "true", "yes")
+
 _DEDUPE: set = set()
 _DEDUPE_MAX = 4000
+
+
+# ---------- util de log ----------
+def log(msg: str) -> None:
+    ts = datetime.now().strftime("%H:%M:%S")
+    print(f"[{ts}] {msg}")
+
 
 # ---------- Navegador ----------
 def build_driver() -> webdriver.Chrome:
     chrome_opts = Options()
-    # Headless novo é mais estável a partir do Chrome 109+
-    chrome_opts.add_argument("--headless=new")
+
+    # Headless
+    if HEADLESS in ("1", "true", "yes", "chrome", "on", ""):
+        # modo headless "clássico" do Chrome (mais compatível para console logs)
+        chrome_opts.add_argument("--headless")
+    elif HEADLESS == "new":
+        chrome_opts.add_argument("--headless=new")
+    # HEADLESS "off": não adiciona headless (para testes locais)
+
     chrome_opts.add_argument("--no-sandbox")
     chrome_opts.add_argument("--disable-gpu")
     chrome_opts.add_argument("--disable-dev-shm-usage")
@@ -51,17 +76,19 @@ def build_driver() -> webdriver.Chrome:
     chrome_opts.add_argument("--no-first-run")
     chrome_opts.add_argument("--no-default-browser-check")
     chrome_opts.add_argument("--window-size=1366,768")
-    # Em proxies mais restritivos, bloquear imagens ajuda a destravar o renderer
+    # bloquear imagens pode destravar renderer em redes mais restritivas
     chrome_opts.add_argument("--blink-settings=imagesEnabled=false")
-    # Alguns sites “pesados” travam recursos; não esperamos todos
+
+    # Estratégia de carregamento: não esperar "complete"
     chrome_opts.set_capability("pageLoadStrategy", "eager")
-    # Logs do console
+
+    # Coleta de logs do console
     chrome_opts.set_capability("goog:loggingPrefs", {"browser": "ALL"})
 
     if USER_AGENT:
         chrome_opts.add_argument(f"user-agent={USER_AGENT}")
 
-    # Perfil temporário único (elimina “user data dir already in use”)
+    # Perfil temporário único (evita "user data dir already in use")
     user_data_dir = tempfile.mkdtemp(prefix="sel_profile_")
     chrome_opts.add_argument(f"--user-data-dir={user_data_dir}")
 
@@ -72,16 +99,32 @@ def build_driver() -> webdriver.Chrome:
 
     driver = webdriver.Chrome(options=chrome_opts, seleniumwire_options=sw_opts)
     driver._user_data_dir = user_data_dir
-    # Timeout de carregamento menor – não fique preso esperando terceiros
+
+    # Timeout de carregamento menor – não ficar preso esperando terceiros
     driver.set_page_load_timeout(45)
 
-    # Desliga cache (evita reuso de requisições quebradas)
+    # Desligar cache
     try:
         driver.execute_cdp_cmd("Network.setCacheDisabled", {"cacheDisabled": True})
     except Exception:
         pass
 
+    if DEBUG_SOCKET:
+        # Log básico de requisições socket.io (XHR/polling)
+        def _request_interceptor(request):
+            if "/socket.io" in request.path:
+                log(f"[SOCK-REQ] {request.method} {request.path}")
+
+        driver.request_interceptor = _request_interceptor
+
+        def _response_interceptor(request, response):
+            if "/socket.io" in request.path:
+                log(f"[SOCK-RES] {response.status_code} {request.path}")
+
+        driver.response_interceptor = _response_interceptor
+
     return driver
+
 
 # ---------- Supabase ----------
 async def send_to_supabase(session: aiohttp.ClientSession, evt: Dict[str, Any]) -> None:
@@ -103,13 +146,15 @@ async def send_to_supabase(session: aiohttp.ClientSession, evt: Dict[str, Any]) 
         async with session.post(SUPABASE_ROUNDS_URL, headers=headers, json=payload) as resp:
             if DEBUG:
                 body = await resp.text()
-                print(f"[SUPABASE] {resp.status} {body[:200]}")
+                log(f"[SUPABASE] {resp.status} {body[:200]}")
     except Exception as e:
-        print(f"[SUPABASE] erro ao enviar: {e}")
+        log(f"[SUPABASE] erro ao enviar: {e}")
+
 
 # ---------- Estratégia (placeholder) ----------
 def apply_strategies(history: Deque[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return []
+
 
 # ---------- Heartbeat ----------
 async def heartbeat(history: Deque[Dict[str, Any]], stop_evt: asyncio.Event) -> None:
@@ -120,8 +165,9 @@ async def heartbeat(history: Deque[Dict[str, Any]], stop_evt: asyncio.Event) -> 
         total = len(history)
         if total != last or DEBUG:
             last = total
-            print(f"[HEARTBEAT] rounds={total} red={counts.get('red',0)} "
-                  f"black={counts.get('black',0)} white={counts.get('white',0)}")
+            log(f"[HEARTBEAT] rounds={total} red={counts.get('red',0)} "
+                f"black={counts.get('black',0)} white={counts.get('white',0)}")
+
 
 # ---------- Navegação robusta ----------
 def dom_ready_state(driver) -> str:
@@ -130,10 +176,12 @@ def dom_ready_state(driver) -> str:
     except WebDriverException:
         return ""
 
+
 def page_min_ready(driver) -> bool:
     # consideramos ok se já chegou a 'interactive' (não precisa 'complete')
     state = dom_ready_state(driver)
     return state in ("interactive", "complete")
+
 
 async def run_loop() -> None:
     history: Deque[Dict[str, Any]] = deque(maxlen=HISTORY_MAXLEN)
@@ -222,18 +270,27 @@ async def run_loop() -> None:
         driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": hook_js})
 
         # Navegação com tolerância a timeout do renderer
-        print(f"[NAV] indo para {GAME_URL}")
+        log(f"[NAV] indo para {GAME_URL}")
         try:
             driver.get(GAME_URL)
         except TimeoutException:
-            # Esperado em ambientes com proxy/terceiros bloqueados; seguimos
-            print("[NAV] timeout do renderer (ignorado); verificando estado do DOM…")
+            log("[NAV] timeout do renderer (ignorado); verificando estado do DOM…")
         except Exception as e:
-            print(f"[NAV] erro ao navegar: {e}")
-            driver.quit()
-            return
+            log(f"[NAV] erro ao navegar: {e}")
+            try:
+                driver.quit()
+            finally:
+                return
 
-        # Confere se ao menos chegou em 'interactive'; senão tenta uma recarga
+        # Estado do DOM e título/URL após navegação
+        try:
+            log(f"[NAV] readyState={dom_ready_state(driver)}")
+            log(f"[NAV] title={driver.title!r}")
+            log(f"[NAV] url={driver.current_url}")
+        except Exception:
+            pass
+
+        # Confere se ao menos chegou em 'interactive'; senão tenta recarga
         try_count = 0
         while not page_min_ready(driver) and try_count < 2:
             try_count += 1
@@ -242,11 +299,20 @@ async def run_loop() -> None:
             except Exception:
                 pass
             await asyncio.sleep(2)
+            log(f"[NAV] retry {try_count} - readyState={dom_ready_state(driver)}")
 
         async def poll_console() -> None:
+            first_dump = True
             while not stop_evt.is_set():
                 try:
-                    for entry in driver.get_log("browser"):
+                    logs = driver.get_log("browser")
+                    # Dump inicial de algumas mensagens para diagnóstico
+                    if first_dump and logs:
+                        first_dump = False
+                        log("[CONSOLE] amostra inicial:")
+                        for entry in logs[:5]:
+                            log(f"    {entry}")
+                    for entry in logs:
                         msg = entry.get("message", "")
                         if "__RESULT__" not in msg:
                             continue
@@ -264,19 +330,20 @@ async def run_loop() -> None:
                             _DEDUPE.add(key)
                         if not evt.get("at"):
                             evt["at"] = datetime.now(timezone.utc).isoformat()
-                        print(f"[RESULT] {evt['roundId']} -> {evt['color'].upper()} "
-                              f"({evt['roll']}) @ {evt['at']}")
+                        log(f"[RESULT] {evt['roundId']} -> {evt['color'].upper()} "
+                            f"({evt['roll']}) @ {evt['at']}")
                         history.append(evt)
                         await send_to_supabase(session, evt)
                         _ = apply_strategies(history)
-                except Exception:
+                except Exception as e:
                     # Em headless + proxy, leitura de log pode falhar esporadicamente
-                    pass
+                    if DEBUG:
+                        log(f"[CONSOLE] erro ao ler logs: {e}")
                 await asyncio.sleep(1.2)
 
         hb_task = asyncio.create_task(heartbeat(history, stop_evt))
         poll_task = asyncio.create_task(poll_console())
-        print("Coletando RESULTADOS… (Ctrl+C para sair)")
+        log("Coletando RESULTADOS… (Ctrl+C para sair)")
         try:
             await asyncio.Event().wait()
         except (asyncio.CancelledError, KeyboardInterrupt):
@@ -294,8 +361,9 @@ async def run_loop() -> None:
                     except Exception:
                         pass
 
+
 if __name__ == "__main__":
     try:
         asyncio.run(run_loop())
     except KeyboardInterrupt:
-        print("Interrompido pelo usuário")
+        log("Interrompido pelo usuário")
