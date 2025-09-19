@@ -1,22 +1,16 @@
-# Imagem base leve (Debian bookworm-slim)
 FROM python:3.11-slim
 
+# Variáveis de ambiente
 ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1
 
-# Dependências do SO para Chromium rodar em headless + fontes + certificados
+# Instala bibliotecas do sistema requeridas pelo Chromium
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     wget \
-    gnupg \
-    # Chromium e driver (driver é opcional se você usar webdriver-manager)
-    chromium \
-    chromium-driver \
-    # libs gráficas/áudio comuns
     libnss3 \
     libatk-bridge2.0-0 \
     libgtk-3-0 \
-    libdrm2 \
     libxkbcommon0 \
     libxdamage1 \
     libxcomposite1 \
@@ -27,19 +21,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-liberation \
   && rm -rf /var/lib/apt/lists/*
 
-# Deixe essas variáveis se seu código precisar referenciar o binário
-ENV CHROME_BIN=/usr/bin/chromium \
-    CHROMEDRIVER=/usr/bin/chromedriver
-
+# Instala dependências Python
 WORKDIR /app
-
-# Instalar dependências Python do projeto
 COPY requirements.txt .
 RUN python -m pip install --upgrade pip \
- && pip install --no-cache-dir -r requirements.txt
+    && pip install -r requirements.txt
 
-# Copiar o código
+# Copia o código-fonte
 COPY . .
 
-# Comando de execução (logs sem buffer)
 CMD ["python", "-u", "extrator.py"]
