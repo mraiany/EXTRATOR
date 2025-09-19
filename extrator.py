@@ -1,3 +1,9 @@
+#!/usr/bin/env python3
+"""
+Extrator de rodadas – Selenium + Selenium-Wire com undetected-chromedriver
+Rodando em modo headless com proxy SOCKS5, enviando resultados para Supabase.
+"""
+
 import os
 import json
 import asyncio
@@ -12,19 +18,51 @@ import undetected_chromedriver as uc
 from seleniumwire import webdriver
 from selenium.common.exceptions import TimeoutException, WebDriverException
 
-# ... [demais imports e configurações] ...
+# -----------------------
+# Configurações via ambiente
+# -----------------------
+GAME_URL = os.getenv("GAME_URL", "https://blaze.bet.br/pt/games/double").strip()
+SUPABASE_ROUNDS_URL = os.getenv("SUPABASE_ROUNDS_URL", "").strip()
+SUPABASE_TOKEN = os.getenv("SUPABASE_TOKEN", "").strip()
+USER_AGENT = os.getenv("USER_AGENT", "").strip()
 
+# HEADLESS: chrome | new | off
+HEADLESS = os.getenv("HEADLESS", "chrome").strip().lower()
+
+# Proxy (use socks5h://user:pass@host:port ou deixe vazio)
+PROXY_URL = (os.getenv("PROXY_URL") or os.getenv("PROXY") or "").strip()
+
+# Tamanho da janela de histórico e intervalo de heartbeat
+HISTORY_MAXLEN = int(os.getenv("HISTORY_MAXLEN", "2000"))
+HEARTBEAT_SECS = int(os.getenv("HEARTBEAT_SECS", "60"))
+
+# Flag de debug para logs extras
+DEBUG = os.getenv("DEBUG", "false").lower() in ("1", "true", "yes")
+
+# Deduplicação em memória para evitar rodadas repetidas
+_DEDUPE: set = set()
+_DEDUPE_MAX = 10000
+
+# -----------------------
+# Função de log simples
+# -----------------------
+def log(*args, **kwargs):
+    ts = datetime.now().strftime("%H:%M:%S")
+    print(f"[{ts}]", *args, **kwargs)
+
+# -----------------------
+# Cria o driver do Chrome
+# -----------------------
 def build_driver():
     chrome_opts = uc.ChromeOptions()
 
-    # Lógica headless
+    # Headless: usa "--headless" por padrão; "--headless=new" se especificado
     if HEADLESS in ("1", "true", "yes", "chrome", ""):
         chrome_opts.add_argument("--headless")
     elif HEADLESS == "new":
         chrome_opts.add_argument("--headless=new")
-    # HEADLESS off: não adiciona flag
 
-    # Outras opções do navegador
+    # Outras flags recomendadas
     chrome_opts.add_argument("--no-sandbox")
     chrome_opts.add_argument("--disable-dev-shm-usage")
     chrome_opts.add_argument("--disable-gpu")
@@ -37,11 +75,11 @@ def build_driver():
     if USER_AGENT:
         chrome_opts.add_argument(f"--user-agent={USER_AGENT}")
 
-    # Diretório temporário para perfil
+    # Cria um perfil temporário isolado
     user_data_dir = tempfile.mkdtemp(prefix="uc_profile_")
     chrome_opts.add_argument(f"--user-data-dir={user_data_dir}")
 
-    # Configuração de proxy para selenium-wire
+    # Configura proxy para selenium-wire
     sw_opts: Dict[str, Any] = {}
     if PROXY_URL:
         sw_opts["proxy"] = {
@@ -49,7 +87,7 @@ def build_driver():
             "https": PROXY_URL,
         }
 
-    # lê caminhos de chrome e chromedriver definidos no Dockerfile
+    # Lê caminhos do Chrome e Chromedriver (definidos no Dockerfile)
     browser_path = os.getenv("CHROME_BINARY_PATH")
     driver_path = os.getenv("CHROMEDRIVER_PATH")
     driver_kwargs: Dict[str, Any] = {}
@@ -58,11 +96,14 @@ def build_driver():
     if driver_path:
         driver_kwargs["driver_executable_path"] = driver_path
 
-    # Cria instância do driver passando apenas argumentos válidos
-    driver = uc.Chrome(options=chrome_opts, seleniumwire_options=sw_opts, **driver_kwargs)
+    # Inicializa o driver
+    driver = uc.Chrome(options=chrome_opts,
+                       seleniumwire_options=sw_opts,
+                       **driver_kwargs)
+    # Guarda o diretório para limpeza futura
     driver._user_data_dir = user_data_dir
 
-    # Ajusta timeouts e desativa cache
+    # Timeout e desativação de cache
     driver.set_page_load_timeout(45)
     try:
         driver.execute_cdp_cmd("Network.setCacheDisabled", {"cacheDisabled": True})
@@ -71,11 +112,8 @@ def build_driver():
 
     return driver
 
-# ... [restante do código do extrator permanece inalterado] ...
-
-
 # -----------------------
-# Supabase sender
+# Envia rodada para Supabase
 # -----------------------
 async def send_to_supabase(session: aiohttp.ClientSession, evt: Dict[str, Any]) -> None:
     if not SUPABASE_ROUNDS_URL:
@@ -101,7 +139,7 @@ async def send_to_supabase(session: aiohttp.ClientSession, evt: Dict[str, Any]) 
         log("[SUPABASE] erro ao enviar:", e)
 
 # -----------------------
-# socket.io parser helper
+# Parser de frames socket.io
 # -----------------------
 def parse_socketio_frames(text: str):
     """
@@ -111,28 +149,20 @@ def parse_socketio_frames(text: str):
     results = []
     if not text:
         return results
-    # split on 42[ occurrences (socket.io)
     try:
         parts = text.split("42[")
-        # parts[0] is prefix, others are JSON arrays like '"data", {...}]...'
         for i in range(1, len(parts)):
-            chunk = "42[" + parts[i]  # restore beginning
+            chunk = "42[" + parts[i]
             try:
-                # remove leading '42' then parse JSON
                 raw = chunk[2:]
-                # raw may end with extra data; find matching bracket slice
-                # attempt to parse until closing bracket
-                # a simple approach: find last ']' in raw (works normally)
                 idx = raw.rfind("]")
                 if idx != -1:
                     json_text = raw[:idx+1]
                 else:
                     json_text = raw
                 arr = json.loads(json_text)
-                # arr[0] is event name, arr[1] body
                 results.append(arr)
             except Exception:
-                # fallback: try parse whole chunk
                 try:
                     arr = json.loads(parts[i])
                     results.append(arr)
@@ -143,9 +173,10 @@ def parse_socketio_frames(text: str):
     return results
 
 # -----------------------
-# main loop
+# Loop principal de coleta
 # -----------------------
 async def run_loop():
+    # Inicializa o histórico com tamanho máximo configurável
     history: Deque[Dict[str, Any]] = deque(maxlen=HISTORY_MAXLEN)
     stop_evt = asyncio.Event()
     timeout = aiohttp.ClientTimeout(total=None)
@@ -163,7 +194,7 @@ async def run_loop():
             driver.quit()
             return
 
-        # logs básicos
+        # Loga estado inicial
         try:
             ready = driver.execute_script("return document.readyState")
             log("[NAV] readyState=", ready)
@@ -172,7 +203,7 @@ async def run_loop():
         except Exception:
             pass
 
-        # heartbeat
+        # Tarefa de heartbeat (log a cada HEARTBEAT_SECS)
         async def heartbeat():
             last_total = -1
             while not stop_evt.is_set():
@@ -186,60 +217,45 @@ async def run_loop():
                         "black=", counts.get("black", 0),
                         "white=", counts.get("white", 0))
 
-        # Poll websocket messages via selenium-wire (recommended)
+        # Tarefa que varre WebSocket requests e extrai eventos
         async def poll_ws_requests():
-            # keep scanning driver.requests for websocket handshake requests that have ws_messages
             seen_req_ids = set()
             while not stop_evt.is_set():
                 try:
-                    # driver.requests is a snapshot-like collection; iterate recent
                     for req in list(driver.requests):
-                        # only consider websocket handshake or socket.io endpoints
                         url = getattr(req, "url", "") or ""
                         if "/socket.io" not in url and not url.startswith("wss://"):
                             continue
-                        # skip if already processed
                         rid = getattr(req, "id", None) or url
-                        if rid in seen_req_ids:
-                            # still can have new ws_messages on same req; we won't skip
-                            pass
-                        # ws_messages attribute holds messages for websocket handshake requests
                         ws_msgs = getattr(req, "ws_messages", None)
                         if not ws_msgs:
                             continue
-                        # iterate messages
                         for m in ws_msgs:
-                            # m.content may be bytes or str
                             content = m.content
                             if isinstance(content, bytes):
                                 try:
                                     content = content.decode("utf-8", errors="ignore")
                                 except Exception:
                                     content = str(content)
-                            # parse socket.io frames inside content
                             frames = parse_socketio_frames(str(content))
                             for frame in frames:
                                 try:
                                     ev_name = frame[0]
                                     body = frame[1] if len(frame) > 1 else None
-                                    # if body structure matches payload => extract
                                     if isinstance(body, dict):
                                         payload = body
-                                        # try to map fields
-                                        rid = payload.get("id") or payload.get("roundId") or None
+                                        rid_evt = payload.get("id") or payload.get("roundId") or None
                                         color_val = payload.get("color")
                                         roll = payload.get("roll")
-                                        # normalize color mapping if numeric
                                         color = None
                                         if isinstance(color_val, int):
                                             color = {1: "red", 2: "black", 0: "white"}.get(color_val, str(color_val))
                                         else:
                                             color = str(color_val) if color_val is not None else None
                                         at = payload.get("created_at") or payload.get("updated_at") or payload.get("at") or datetime.now(timezone.utc).isoformat()
-                                        if rid is None and roll is None:
-                                            # not the payload we want
+                                        if rid_evt is None and roll is None:
                                             continue
-                                        evt = {"roundId": rid, "color": color, "roll": roll, "at": at}
+                                        evt = {"roundId": rid_evt, "color": color, "roll": roll, "at": at}
                                         key = f"{evt.get('roundId')}|{evt.get('roll')}|{evt.get('at')}"
                                         if key in _DEDUPE:
                                             continue
@@ -249,21 +265,18 @@ async def run_loop():
                                             _DEDUPE.add(key)
                                         log("[WS-RESULT]", evt)
                                         history.append(evt)
-                                        # async send to supabase
                                         asyncio.create_task(send_to_supabase(session, evt))
                                 except Exception as e:
                                     if DEBUG:
                                         log("[WS-PARSE-ERR]", e)
-                        # mark seen
                         seen_req_ids.add(rid)
-                    # small sleep to avoid busy loop
                     await asyncio.sleep(0.8)
                 except Exception as e:
                     if DEBUG:
                         log("[POLL_WS ERR]", e)
                     await asyncio.sleep(1.5)
 
-        # fallback: poll browser console for __RESULT__ messages
+        # Tarefa fallback: lê logs do console do navegador
         async def poll_console():
             first = True
             while not stop_evt.is_set():
@@ -272,7 +285,6 @@ async def run_loop():
                     try:
                         logs = driver.get_log("browser")
                     except Exception:
-                        # headless new may not present console logs in the same way
                         pass
                     if first and logs:
                         first = False
@@ -305,7 +317,7 @@ async def run_loop():
                         log("[CONSOLE POLL ERR]", e)
                 await asyncio.sleep(1.2)
 
-        # start tasks
+        # Inicializa tarefas
         hb = asyncio.create_task(heartbeat())
         ws_task = asyncio.create_task(poll_ws_requests())
         console_task = asyncio.create_task(poll_console())
@@ -313,8 +325,7 @@ async def run_loop():
         log("Coletando RESULTADOS... (rodando headless)")
 
         try:
-            # rodar indefinidamente; Render container mantem isso vivo
-            await asyncio.Event().wait()
+            await asyncio.Event().wait()  # roda indefinidamente
         except (asyncio.CancelledError, KeyboardInterrupt):
             pass
         finally:
