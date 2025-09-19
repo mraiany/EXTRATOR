@@ -1,8 +1,6 @@
+.git
 __pycache__/
 *.pyc
-*.pyo
-*.pyd
+*venv*/
 .env
-.git
-.gitignore
-README.md
+.ms-playwright/
