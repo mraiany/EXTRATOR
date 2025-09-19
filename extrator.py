@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-Extrator de rodadas – Selenium + Selenium-Wire com undetected-chromedriver
-Rodando em modo headless com proxy SOCKS5, enviando resultados para Supabase.
+Extrator de rodadas – Selenium + Selenium-Wire com undetected-chromedriver.
 """
 
 import os
@@ -14,8 +13,9 @@ from datetime import datetime, timezone
 from typing import Deque, Dict, Any, List
 
 import aiohttp
-import undetected_chromedriver as uc
-from seleniumwire import webdriver
+# IMPORTANTE: use a integração do seleniumwire com undetected-chromedriver,
+# conforme a documentação:contentReference[oaicite:2]{index=2}.
+import seleniumwire.undetected_chromedriver as uc
 from selenium.common.exceptions import TimeoutException, WebDriverException
 
 # -----------------------
@@ -25,44 +25,28 @@ GAME_URL = os.getenv("GAME_URL", "https://blaze.bet.br/pt/games/double").strip()
 SUPABASE_ROUNDS_URL = os.getenv("SUPABASE_ROUNDS_URL", "").strip()
 SUPABASE_TOKEN = os.getenv("SUPABASE_TOKEN", "").strip()
 USER_AGENT = os.getenv("USER_AGENT", "").strip()
-
-# HEADLESS: chrome | new | off
 HEADLESS = os.getenv("HEADLESS", "chrome").strip().lower()
-
-# Proxy (use socks5h://user:pass@host:port ou deixe vazio)
 PROXY_URL = (os.getenv("PROXY_URL") or os.getenv("PROXY") or "").strip()
-
-# Tamanho da janela de histórico e intervalo de heartbeat
 HISTORY_MAXLEN = int(os.getenv("HISTORY_MAXLEN", "2000"))
 HEARTBEAT_SECS = int(os.getenv("HEARTBEAT_SECS", "60"))
-
-# Flag de debug para logs extras
 DEBUG = os.getenv("DEBUG", "false").lower() in ("1", "true", "yes")
 
-# Deduplicação em memória para evitar rodadas repetidas
 _DEDUPE: set = set()
 _DEDUPE_MAX = 10000
 
-# -----------------------
-# Função de log simples
-# -----------------------
 def log(*args, **kwargs):
     ts = datetime.now().strftime("%H:%M:%S")
     print(f"[{ts}]", *args, **kwargs)
 
 # -----------------------
-# Cria o driver do Chrome
+# Cria o driver Chrome/Chromium
 # -----------------------
 def build_driver():
     chrome_opts = uc.ChromeOptions()
-
-    # Headless: usa "--headless" por padrão; "--headless=new" se especificado
     if HEADLESS in ("1", "true", "yes", "chrome", ""):
         chrome_opts.add_argument("--headless")
     elif HEADLESS == "new":
         chrome_opts.add_argument("--headless=new")
-
-    # Outras flags recomendadas
     chrome_opts.add_argument("--no-sandbox")
     chrome_opts.add_argument("--disable-dev-shm-usage")
     chrome_opts.add_argument("--disable-gpu")
@@ -71,15 +55,12 @@ def build_driver():
     chrome_opts.add_argument("--disable-extensions")
     chrome_opts.add_argument("--disable-background-networking")
     chrome_opts.add_argument("--disable-features=VizDisplayCompositor")
-
     if USER_AGENT:
         chrome_opts.add_argument(f"--user-agent={USER_AGENT}")
 
-    # Cria um perfil temporário isolado
     user_data_dir = tempfile.mkdtemp(prefix="uc_profile_")
     chrome_opts.add_argument(f"--user-data-dir={user_data_dir}")
 
-    # Configura proxy para selenium-wire
     sw_opts: Dict[str, Any] = {}
     if PROXY_URL:
         sw_opts["proxy"] = {
@@ -87,7 +68,6 @@ def build_driver():
             "https": PROXY_URL,
         }
 
-    # Lê caminhos do Chrome e Chromedriver (definidos no Dockerfile)
     browser_path = os.getenv("CHROME_BINARY_PATH")
     driver_path = os.getenv("CHROMEDRIVER_PATH")
     driver_kwargs: Dict[str, Any] = {}
@@ -96,20 +76,17 @@ def build_driver():
     if driver_path:
         driver_kwargs["driver_executable_path"] = driver_path
 
-    # Inicializa o driver
+    # Atenção: agora usamos uc.Chrome() do seleniumwire,
+    # que integra automaticamente com a API .requests:contentReference[oaicite:3]{index=3}.
     driver = uc.Chrome(options=chrome_opts,
                        seleniumwire_options=sw_opts,
                        **driver_kwargs)
-    # Guarda o diretório para limpeza futura
     driver._user_data_dir = user_data_dir
-
-    # Timeout e desativação de cache
     driver.set_page_load_timeout(45)
     try:
         driver.execute_cdp_cmd("Network.setCacheDisabled", {"cacheDisabled": True})
     except Exception:
         pass
-
     return driver
 
 # -----------------------
@@ -142,10 +119,6 @@ async def send_to_supabase(session: aiohttp.ClientSession, evt: Dict[str, Any]) 
 # Parser de frames socket.io
 # -----------------------
 def parse_socketio_frames(text: str):
-    """
-    Recebe uma string (conteúdo WS/socket.io payload) e tenta extrair objetos
-    do tipo 42[ ... ] (socket.io event frames) e devolve lista de objetos.
-    """
     results = []
     if not text:
         return results
@@ -156,10 +129,7 @@ def parse_socketio_frames(text: str):
             try:
                 raw = chunk[2:]
                 idx = raw.rfind("]")
-                if idx != -1:
-                    json_text = raw[:idx+1]
-                else:
-                    json_text = raw
+                json_text = raw[:idx+1] if idx != -1 else raw
                 arr = json.loads(json_text)
                 results.append(arr)
             except Exception:
@@ -173,10 +143,9 @@ def parse_socketio_frames(text: str):
     return results
 
 # -----------------------
-# Loop principal de coleta
+# Loop principal
 # -----------------------
 async def run_loop():
-    # Inicializa o histórico com tamanho máximo configurável
     history: Deque[Dict[str, Any]] = deque(maxlen=HISTORY_MAXLEN)
     stop_evt = asyncio.Event()
     timeout = aiohttp.ClientTimeout(total=None)
@@ -194,7 +163,9 @@ async def run_loop():
             driver.quit()
             return
 
-        # Loga estado inicial
+        # Verifica se a Blaze redirecionou para 'blocked'
+        if 'blocked' in driver.current_url:
+            log("[ALERTA] A Blaze redirecionou para 'blocked'. Verifique seu proxy e localização.")
         try:
             ready = driver.execute_script("return document.readyState")
             log("[NAV] readyState=", ready)
@@ -203,7 +174,6 @@ async def run_loop():
         except Exception:
             pass
 
-        # Tarefa de heartbeat (log a cada HEARTBEAT_SECS)
         async def heartbeat():
             last_total = -1
             while not stop_evt.is_set():
@@ -217,7 +187,6 @@ async def run_loop():
                         "black=", counts.get("black", 0),
                         "white=", counts.get("white", 0))
 
-        # Tarefa que varre WebSocket requests e extrai eventos
         async def poll_ws_requests():
             seen_req_ids = set()
             while not stop_evt.is_set():
@@ -233,26 +202,21 @@ async def run_loop():
                         for m in ws_msgs:
                             content = m.content
                             if isinstance(content, bytes):
-                                try:
-                                    content = content.decode("utf-8", errors="ignore")
-                                except Exception:
-                                    content = str(content)
+                                content = content.decode("utf-8", errors="ignore")
                             frames = parse_socketio_frames(str(content))
                             for frame in frames:
                                 try:
-                                    ev_name = frame[0]
                                     body = frame[1] if len(frame) > 1 else None
                                     if isinstance(body, dict):
                                         payload = body
                                         rid_evt = payload.get("id") or payload.get("roundId") or None
                                         color_val = payload.get("color")
                                         roll = payload.get("roll")
-                                        color = None
-                                        if isinstance(color_val, int):
-                                            color = {1: "red", 2: "black", 0: "white"}.get(color_val, str(color_val))
-                                        else:
-                                            color = str(color_val) if color_val is not None else None
-                                        at = payload.get("created_at") or payload.get("updated_at") or payload.get("at") or datetime.now(timezone.utc).isoformat()
+                                        color = ({1: "red", 2: "black", 0: "white"}.get(color_val, str(color_val))
+                                                 if isinstance(color_val, int)
+                                                 else str(color_val) if color_val is not None else None)
+                                        at = (payload.get("created_at") or payload.get("updated_at") or
+                                              payload.get("at") or datetime.now(timezone.utc).isoformat())
                                         if rid_evt is None and roll is None:
                                             continue
                                         evt = {"roundId": rid_evt, "color": color, "roll": roll, "at": at}
@@ -276,7 +240,6 @@ async def run_loop():
                         log("[POLL_WS ERR]", e)
                     await asyncio.sleep(1.5)
 
-        # Tarefa fallback: lê logs do console do navegador
         async def poll_console():
             first = True
             while not stop_evt.is_set():
@@ -296,8 +259,7 @@ async def run_loop():
                         if "__RESULT__" not in msg:
                             continue
                         try:
-                            payload = msg.split("__RESULT__", 1)[1]
-                            evt = json.loads(payload)
+                            evt = json.loads(msg.split("__RESULT__", 1)[1])
                         except Exception:
                             continue
                         key = f"{evt.get('roundId')}|{evt.get('roll')}|{evt.get('at')}"
@@ -317,7 +279,6 @@ async def run_loop():
                         log("[CONSOLE POLL ERR]", e)
                 await asyncio.sleep(1.2)
 
-        # Inicializa tarefas
         hb = asyncio.create_task(heartbeat())
         ws_task = asyncio.create_task(poll_ws_requests())
         console_task = asyncio.create_task(poll_console())
@@ -325,7 +286,7 @@ async def run_loop():
         log("Coletando RESULTADOS... (rodando headless)")
 
         try:
-            await asyncio.Event().wait()  # roda indefinidamente
+            await asyncio.Event().wait()
         except (asyncio.CancelledError, KeyboardInterrupt):
             pass
         finally:
