@@ -1,11 +1,12 @@
 FROM python:3.11-slim
 
-# Variáveis de ambiente
+# Variáveis de ambiente base
 ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1
 
-# Dependências nativas necessárias para Chrome/Chromedriver em modo headless
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Instala dependências nativas e o navegador Chromium com seu driver
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
     ca-certificates \
     wget \
     libnss3 \
@@ -19,21 +20,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libasound2 \
     libxshmfence1 \
     fonts-liberation \
-  && rm -rf /var/lib/apt/lists/*
+    chromium \
+    chromium-driver \
+ && rm -rf /var/lib/apt/lists/*
 
-# Instalar dependências Python
+# Instala dependências Python
 WORKDIR /app
 COPY requirements.txt .
 RUN python -m pip install --upgrade pip \
-    && pip install -r requirements.txt
+ && pip install -r requirements.txt
 
-# Copiar código
+# Copia o código
 COPY . .
 
-# (Opcional) Defina um User-Agent padrão aqui se quiser
-# ENV USER_AGENT="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
-
-# HEADLESS=chrome é a recomendação para capturar console.log com mais estabilidade
-ENV HEADLESS=chrome
+# Define caminhos dos binários do Chrome/Chromium para uso no Python
+ENV CHROME_BINARY_PATH=/usr/bin/chromium \
+    CHROMEDRIVER_PATH=/usr/bin/chromedriver \
+    HEADLESS=chrome
 
 CMD ["python", "-u", "extrator.py"]
