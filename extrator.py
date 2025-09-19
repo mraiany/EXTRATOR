@@ -1,58 +1,30 @@
-#!/usr/bin/env python3
-# extrator.py - headless, selenium-wire + undetected_chromedriver
-# Captura mensagens WebSocket (socket.io) diretamente via selenium-wire.ws_messages
-
 import os
 import json
-import time
+import asyncio
 import tempfile
 import shutil
-import asyncio
 from collections import deque, Counter
 from datetime import datetime, timezone
 from typing import Deque, Dict, Any, List
 
 import aiohttp
 import undetected_chromedriver as uc
-from seleniumwire import webdriver  # selenium-wire hooks via undetected_chromedriver
+from seleniumwire import webdriver
 from selenium.common.exceptions import TimeoutException, WebDriverException
 
-# -----------------------
-# ENV / CONFIG
-# -----------------------
-GAME_URL = os.getenv("GAME_URL", "https://blaze.bet.br/pt/games/double").strip()
-SUPABASE_ROUNDS_URL = os.getenv("SUPABASE_ROUNDS_URL", "").strip()
-SUPABASE_TOKEN = os.getenv("SUPABASE_TOKEN", "").strip()
-USER_AGENT = os.getenv("USER_AGENT", "").strip()
+# ... [demais imports e configurações] ...
 
-# HEADLESS: "chrome", "new", "off"
-HEADLESS = os.getenv("HEADLESS", "chrome").strip().lower()
-PROXY_URL = (os.getenv("PROXY_URL") or os.getenv("PROXY") or "").strip()  # use socks5h://user:pass@host:port
-HISTORY_MAXLEN = int(os.getenv("HISTORY_MAXLEN", "2000"))
-HEARTBEAT_SECS = int(os.getenv("HEARTBEAT_SECS", "60"))
-DEBUG = os.getenv("DEBUG", "false").lower() in ("1", "true", "yes")
-
-# dedupe set in-memory
-_DEDUPE = set()
-_DEDUPE_MAX = 10000
-
-def log(*args, **kwargs):
-    ts = datetime.now().strftime("%H:%M:%S")
-    print(f"[{ts}]", *args, **kwargs)
-
-# -----------------------
-# build driver (undetected + selenium-wire)
-# -----------------------
 def build_driver():
     chrome_opts = uc.ChromeOptions()
 
-    # headless logic
+    # Lógica headless
     if HEADLESS in ("1", "true", "yes", "chrome", ""):
         chrome_opts.add_argument("--headless")
     elif HEADLESS == "new":
         chrome_opts.add_argument("--headless=new")
-    # else HEADLESS == 'off' -> run headful (not for Render)
+    # HEADLESS off: não adiciona flag
 
+    # Outras opções do navegador
     chrome_opts.add_argument("--no-sandbox")
     chrome_opts.add_argument("--disable-dev-shm-usage")
     chrome_opts.add_argument("--disable-gpu")
@@ -60,46 +32,47 @@ def build_driver():
     chrome_opts.add_argument("--blink-settings=imagesEnabled=false")
     chrome_opts.add_argument("--disable-extensions")
     chrome_opts.add_argument("--disable-background-networking")
-    chrome_opts.add_argument("--disable-features=VizDisplayCompositor")  # can help headless stability
+    chrome_opts.add_argument("--disable-features=VizDisplayCompositor")
 
     if USER_AGENT:
         chrome_opts.add_argument(f"--user-agent={USER_AGENT}")
 
-    # temporary profile dir to avoid collisions
+    # Diretório temporário para perfil
     user_data_dir = tempfile.mkdtemp(prefix="uc_profile_")
     chrome_opts.add_argument(f"--user-data-dir={user_data_dir}")
 
-    # selenium-wire options
+    # Configuração de proxy para selenium-wire
     sw_opts: Dict[str, Any] = {}
     if PROXY_URL:
-        # Selenium Wire accepts socks5 URLs. Use socks5h for proxy-side DNS resolution.
         sw_opts["proxy"] = {
             "http": PROXY_URL,
             "https": PROXY_URL,
-            # optional: 'no_proxy': 'localhost,127.0.0.1'
         }
 
-    # set port or any other sw_opts if needed
-    # create driver
-    driver = uc.Chrome(options=chrome_opts, seleniumwire_options=sw_opts)
+    # lê caminhos de chrome e chromedriver definidos no Dockerfile
+    browser_path = os.getenv("CHROME_BINARY_PATH")
+    driver_path = os.getenv("CHROMEDRIVER_PATH")
+    driver_kwargs: Dict[str, Any] = {}
+    if browser_path:
+        driver_kwargs["browser_executable_path"] = browser_path
+    if driver_path:
+        driver_kwargs["driver_executable_path"] = driver_path
+
+    # Cria instância do driver passando apenas argumentos válidos
+    driver = uc.Chrome(options=chrome_opts, seleniumwire_options=sw_opts, **driver_kwargs)
     driver._user_data_dir = user_data_dir
 
-    # minor timeouts
+    # Ajusta timeouts e desativa cache
     driver.set_page_load_timeout(45)
-
-    # disable cache if possible via CDP
     try:
         driver.execute_cdp_cmd("Network.setCacheDisabled", {"cacheDisabled": True})
     except Exception:
         pass
 
-    # Request interceptor example: add headers to a specific host if needed
-    # def req_interceptor(request):
-    #     if 'algum-host' in request.host:
-    #         request.headers['X-My'] = 'value'
-    # driver.request_interceptor = req_interceptor
-
     return driver
+
+# ... [restante do código do extrator permanece inalterado] ...
+
 
 # -----------------------
 # Supabase sender
