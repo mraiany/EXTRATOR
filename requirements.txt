@@ -2,4 +2,8 @@ requests
 python-dotenv==1.0.1
 aiohttp==3.9.1
 selenium-wire==5.1.0
-undetected-chromedriver==3.3.1   # verifique última versão compatível
+# Pin to a non-yanked version of undetected-chromedriver. Version 3.3.1 was
+# yanked from PyPI and causes build failures. The latest available version
+# as of Feb 17, 2024 is 3.5.5:contentReference[oaicite:2]{index=2}, which is compatible with
+# Selenium 4.9+:contentReference[oaicite:3]{index=3}. This pin restores installability.
+undetected-chromedriver==3.5.5
