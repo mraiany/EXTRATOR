@@ -1,30 +1,34 @@
 #!/usr/bin/env python3
 """
 extrator.py - Extrator de rodadas usando Selenium + SeleniumWire
-Usa proxy HTTP ou SOCKS5 (via selenium-wire), gera histórico de rodadas,
-envia para Supabase e realiza heartbeat.
+Suporta proxy HTTP ou SOCKS5 (via selenium-wire), captura eventos pelo console,
+envia para o Supabase e registra heartbeat.
+
+Principais mudanças:
+- REMOVIDO --user-data-dir (era a origem do erro "user data directory is already in use")
+- Flags extras para estabilidade em headless (--remote-debugging-port=0, etc.)
+- Habilitação explícita de logs de console (goog:loggingPrefs)
 """
 
 import os
 import json
-import time
 import asyncio
-import tempfile
-import shutil
+import subprocess
 from datetime import datetime, timezone
 from collections import deque, Counter
-from typing import Deque, Dict, List, Optional, Any
+from typing import Deque, Dict, List, Any
 
 import aiohttp
-from seleniumwire import webdriver  # proxy via SeleniumWire
+from seleniumwire import webdriver   # pip install selenium-wire
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.desired_capabilities import DesiredCapabilities
 
 # ==================== Configs via env ====================
 GAME_URL = os.getenv("GAME_URL", "https://blaze.bet.br/pt/games/double")
 SUPABASE_ROUNDS_URL = os.getenv("SUPABASE_ROUNDS_URL", "")
 SUPABASE_TOKEN = os.getenv("SUPABASE_TOKEN", "")
 USER_AGENT = os.getenv("USER_AGENT", "").strip()
-PROXY_URL = os.getenv("PROXY_URL", "").strip()
+PROXY_URL = os.getenv("PROXY_URL", "").strip()  # ex.: socks5://user:pass@ip:porta
 HISTORY_MAXLEN = int(os.getenv("HISTORY_MAXLEN", "2000"))
 HEARTBEAT_SECS = int(os.getenv("HEARTBEAT_SECS", "60"))
 DEBUG = os.getenv("DEBUG", "false").lower() in ("1", "true", "yes")
@@ -32,12 +36,22 @@ DEBUG = os.getenv("DEBUG", "false").lower() in ("1", "true", "yes")
 _DEDUPE: set = set()
 _DEDUPE_MAX = 4000
 
+
+def _kill_zombie_chrome():
+    """(Opcional) tenta encerrar chromes zumbis antes de subir um novo."""
+    try:
+        subprocess.run(["pkill", "-f", "chrome"], check=False)
+    except Exception:
+        pass
+
+
 def build_driver() -> webdriver.Chrome:
     """
-    Cria uma instância do Chrome headless usando selenium-wire.
-    Configura user-agent, proxy HTTP ou SOCKS5, diretório temporário
-    para profile (evita erro de diretório em uso) e flags de desempenho.
+    Chrome headless via selenium-wire, SEM --user-data-dir.
+    Mantém suporte SOCKS5/HTTP e habilita logs de console.
     """
+    _kill_zombie_chrome()
+
     opts = Options()
     opts.headless = True
     opts.add_argument("--no-sandbox")
@@ -50,34 +64,42 @@ def build_driver() -> webdriver.Chrome:
     opts.add_argument("--disable-background-timer-throttling")
     opts.add_argument("--disable-renderer-backgrounding")
     opts.add_argument("--disable-ipc-flooding-protection")
+    # evita conflitos com porta de devtools
+    opts.add_argument("--remote-debugging-port=0")
+    # algumas otimizações extras
+    opts.add_argument("--disable-features=Translate,BackForwardCache,AvoidUnnecessaryBeforeUnloadCheckSync")
 
-    # Define user-agent se houver
     if USER_AGENT:
         opts.add_argument(f"user-agent={USER_AGENT}")
 
-    # Cria um diretório temporário para profile do Chrome
-    user_data_dir = tempfile.mkdtemp(prefix="seluser-")
-    opts.add_argument(f"--user-data-dir={user_data_dir}")
+    # Habilita logs de console (necessário para driver.get_log("browser"))
+    caps = DesiredCapabilities.CHROME.copy()
+    caps["goog:loggingPrefs"] = {"browser": "ALL"}
 
-    # Configura proxy via selenium-wire
-    seleniumwire_options = {}
+    # Proxy via selenium-wire (HTTP/HTTPS/SOCKS5)
+    seleniumwire_options: Dict[str, Any] = {}
     if PROXY_URL:
-        # Espera-se formato: schema://user:pass@host:porta ou host:porta
-        # Converte para dict para selenium-wire
-        seleniumwire_options['proxy'] = {'http': PROXY_URL, 'https': PROXY_URL}
+        # aceita 'socks5://user:pass@ip:porta' ou 'http://user:pass@ip:porta'
+        seleniumwire_options["proxy"] = {
+            "http": PROXY_URL,
+            "https": PROXY_URL,
+            "no_proxy": "localhost,127.0.0.1",
+        }
 
-    driver = webdriver.Chrome(options=opts, seleniumwire_options=seleniumwire_options)
-
-    # Anexa diretório para limpeza ao atributo para remoção ao finalizar
-    driver._user_data_dir = user_data_dir
+    driver = webdriver.Chrome(
+        options=opts,
+        desired_capabilities=caps,
+        seleniumwire_options=seleniumwire_options,
+    )
+    driver.set_script_timeout(60)
     return driver
 
+
 async def send_to_supabase(session: aiohttp.ClientSession, evt: Dict[str, Any]) -> None:
-    """
-    Envia dados de uma rodada para supabase se configurado.
-    """
+    """Envia uma rodada para o Supabase (se configurado)."""
     if not SUPABASE_ROUNDS_URL:
         return
+
     payload = {
         "round_id": evt.get("roundId"),
         "color": evt.get("color"),
@@ -85,11 +107,13 @@ async def send_to_supabase(session: aiohttp.ClientSession, evt: Dict[str, Any]) 
         "occurred_at": evt.get("at"),
         "ingested_at": datetime.now(timezone.utc).isoformat(),
     }
+
     headers = {"Content-Type": "application/json"}
     if SUPABASE_TOKEN:
         headers["apikey"] = SUPABASE_TOKEN
         headers["Authorization"] = f"Bearer {SUPABASE_TOKEN}"
         headers["Prefer"] = "resolution=merge-duplicates"
+
     try:
         async with session.post(SUPABASE_ROUNDS_URL, headers=headers, json=payload) as resp:
             if DEBUG:
@@ -98,14 +122,13 @@ async def send_to_supabase(session: aiohttp.ClientSession, evt: Dict[str, Any]) 
     except Exception as e:
         print(f"[SUPABASE] erro ao enviar: {e}")
 
+
 def apply_strategies(history: Deque[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    # Lógica de sinal opcional
+    # Placeholder para sua lógica de sinais
     return []
 
+
 async def heartbeat(history: Deque[Dict[str, Any]], stop_evt: asyncio.Event) -> None:
-    """
-    Imprime heartbeat periódico de número de rodadas e contagem de cores.
-    """
     last_total = -1
     while not stop_evt.is_set():
         await asyncio.sleep(HEARTBEAT_SECS)
@@ -113,7 +136,11 @@ async def heartbeat(history: Deque[Dict[str, Any]], stop_evt: asyncio.Event) -> 
         total = len(history)
         if total != last_total or DEBUG:
             last_total = total
-            print(f"[HEARTBEAT] rounds={total} red={counts.get('red',0)} black={counts.get('black',0)} white={counts.get('white',0)}")
+            print(
+                f"[HEARTBEAT] rounds={total} red={counts.get('red',0)} "
+                f"black={counts.get('black',0)} white={counts.get('white',0)}"
+            )
+
 
 async def run_loop() -> None:
     history: Deque[Dict[str, Any]] = deque(maxlen=HISTORY_MAXLEN)
@@ -123,22 +150,24 @@ async def run_loop() -> None:
     async with aiohttp.ClientSession(timeout=timeout) as session:
         driver = build_driver()
 
-        # injeta script para capturar pacotes socket.io e logs
-        hook_js = """
+        # Hook JS para “escutar” os pacotes do socket.io e emitir no console
+        hook_js = r"""
         (() => {
           const COLORS = { 1: "red", 0: "white", 2: "black" };
           window.__emittedResults = window.__emittedResults || new Set();
 
           function tryEmitResult(obj) {
             if (!obj || !obj.id || !obj.payload) return false;
+
             const isResult =
               obj.id === "double.result" ||
               obj.id === "double:result" ||
               obj.id === "new:game_result" ||
               (obj.id === "double.tick" &&
-                obj.payload &&
-                obj.payload.color != null &&
-                obj.payload.roll != null);
+               obj.payload &&
+               obj.payload.color != null &&
+               obj.payload.roll != null);
+
             if (!isResult) return false;
 
             const rid   = obj.payload?.id || null;
@@ -158,7 +187,7 @@ async def run_loop() -> None:
             if (typeof str !== "string") return;
             if (!str.startsWith("42")) return;
             try {
-              const arr = JSON.parse(str.slice(2));
+              const arr = JSON.parse(str.slice(2)); // ["data", {...}]
               const eventName = arr?.[0];
               const body      = arr?.[1];
               if (eventName === "data") tryEmitResult(body);
@@ -193,7 +222,8 @@ async def run_loop() -> None:
             if (this.__isSock) {
               this.addEventListener("load", function () {
                 try {
-                  const text = (this.responseType === "" || this.responseType === "text") ? (this.responseText || "") : "";
+                  const text = (this.responseType === "" || this.responseType === "text")
+                               ? (this.responseText || "") : "";
                   const parts = String(text || "").split("42[");
                   for (let i = 1; i < parts.length; i++) parseSocketIoPacket("42[" + parts[i]);
                 } catch (e) {}
@@ -214,7 +244,7 @@ async def run_loop() -> None:
         })();
         """
 
-        # injeta script antes de qualquer navegação
+        # injeta script ANTES de qualquer navegação
         driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": hook_js})
 
         try:
@@ -226,44 +256,44 @@ async def run_loop() -> None:
             return
 
         async def poll_console() -> None:
-            """
-            Varre mensagens do console e processa os resultados __RESULT__.
-            """
+            """Lê o console do navegador e processa __RESULT__."""
             while not stop_evt.is_set():
-                for entry in driver.get_log("browser"):
-                    text = entry.get("message", "")
-                    if not text:
-                        continue
-                    # mensagem bruta do Chrome; pega JSON depois de "__RESULT__"
-                    if "__RESULT__" not in text:
-                        continue
-                    try:
-                        payload_str = text.split("__RESULT__", 1)[1]
-                        evt = json.loads(payload_str)
-                    except Exception:
-                        continue
-                    key = f"{evt.get('roundId')}|{evt.get('roll')}|{evt.get('at')}"
-                    if key in _DEDUPE:
-                        continue
-                    _DEDUPE.add(key)
-                    if len(_DEDUPE) > _DEDUPE_MAX:
-                        _DEDUPE.clear()
+                try:
+                    for entry in driver.get_log("browser"):
+                        raw = entry.get("message", "") or ""
+                        if "__RESULT__" not in raw:
+                            continue
+                        try:
+                            payload_str = raw.split("__RESULT__", 1)[1]
+                            evt = json.loads(payload_str)
+                        except Exception:
+                            continue
+
+                        key = f"{evt.get('roundId')}|{evt.get('roll')}|{evt.get('at')}"
+                        if key in _DEDUPE:
+                            continue
                         _DEDUPE.add(key)
-                    if not evt.get("at"):
-                        evt["at"] = datetime.now(timezone.utc).isoformat()
+                        if len(_DEDUPE) > _DEDUPE_MAX:
+                            _DEDUPE.clear()
+                            _DEDUPE.add(key)
 
-                    # mostra e salva
-                    print(f"[RESULT] {evt['roundId']} -> {evt['color'].upper()} ({evt['roll']}) @ {evt['at']}")
-                    history.append(evt)
+                        if not evt.get("at"):
+                            evt["at"] = datetime.now(timezone.utc).isoformat()
 
-                    # envia ao Supabase
-                    await send_to_supabase(session, evt)
+                        # log e buffer
+                        print(f"[RESULT] {evt['roundId']} -> {evt['color'].upper()} ({evt['roll']}) @ {evt['at']}")
+                        history.append(evt)
 
-                    # aplica estratégias (opcional)
-                    signals = apply_strategies(history)
-                    # se houver, enviar sinais via outro endpoint
+                        # envia
+                        await send_to_supabase(session, evt)
+                        # sua estratégia (se quiser)
+                        _ = apply_strategies(history)
 
-                await asyncio.sleep(1.5)
+                except Exception as e:
+                    if DEBUG:
+                        print(f"[POLL] exception: {e}")
+
+                await asyncio.sleep(1.2)
 
         hb_task = asyncio.create_task(heartbeat(history, stop_evt))
         poll_task = asyncio.create_task(poll_console())
@@ -277,13 +307,11 @@ async def run_loop() -> None:
             stop_evt.set()
             hb_task.cancel()
             poll_task.cancel()
-            driver.quit()
-            # Remove profile temporário
-            if hasattr(driver, "_user_data_dir"):
-                try:
-                    shutil.rmtree(driver._user_data_dir)
-                except Exception:
-                    pass
+            try:
+                driver.quit()
+            except Exception:
+                pass
+
 
 if __name__ == "__main__":
     try:
