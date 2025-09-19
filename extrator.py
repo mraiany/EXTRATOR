@@ -1,132 +1,109 @@
 #!/usr/bin/env python3
-"""
-Extrator de rodadas – Selenium + Selenium-Wire
-- Headless ajustável por variável de ambiente (HEADLESS)
-- Logs estratégicos para diagnóstico
-- Compatibilidade PROXY_URL / PROXY
-- Amostra de console e estado do DOM
-- Hook JS para interceptar socket.io (fetch/XHR/WebSocket)
-"""
+# extrator.py - headless, selenium-wire + undetected_chromedriver
+# Captura mensagens WebSocket (socket.io) diretamente via selenium-wire.ws_messages
 
 import os
 import json
-import asyncio
+import time
 import tempfile
 import shutil
+import asyncio
 from collections import deque, Counter
 from datetime import datetime, timezone
 from typing import Deque, Dict, Any, List
 
 import aiohttp
-from seleniumwire import webdriver
-from selenium.webdriver.chrome.options import Options
+import undetected_chromedriver as uc
+from seleniumwire import webdriver  # selenium-wire hooks via undetected_chromedriver
 from selenium.common.exceptions import TimeoutException, WebDriverException
 
-# ---------- ENV ----------
+# -----------------------
+# ENV / CONFIG
+# -----------------------
 GAME_URL = os.getenv("GAME_URL", "https://blaze.bet.br/pt/games/double").strip()
 SUPABASE_ROUNDS_URL = os.getenv("SUPABASE_ROUNDS_URL", "").strip()
 SUPABASE_TOKEN = os.getenv("SUPABASE_TOKEN", "").strip()
 USER_AGENT = os.getenv("USER_AGENT", "").strip()
 
-# HEADLESS: "chrome" (recomendado), "new", "off"
+# HEADLESS: "chrome", "new", "off"
 HEADLESS = os.getenv("HEADLESS", "chrome").strip().lower()
-
-# Proxy compat: aceita PROXY_URL (novo) ou PROXY (legado)
-PROXY_URL = (os.getenv("PROXY_URL") or os.getenv("PROXY") or "").strip()
-
+PROXY_URL = (os.getenv("PROXY_URL") or os.getenv("PROXY") or "").strip()  # use socks5h://user:pass@host:port
 HISTORY_MAXLEN = int(os.getenv("HISTORY_MAXLEN", "2000"))
 HEARTBEAT_SECS = int(os.getenv("HEARTBEAT_SECS", "60"))
 DEBUG = os.getenv("DEBUG", "false").lower() in ("1", "true", "yes")
 
-# Inspeção de rede (apenas logs) – cuidado com volume
-DEBUG_SOCKET = os.getenv("DEBUG_SOCKET", "false").lower() in ("1", "true", "yes")
+# dedupe set in-memory
+_DEDUPE = set()
+_DEDUPE_MAX = 10000
 
-_DEDUPE: set = set()
-_DEDUPE_MAX = 4000
-
-
-# ---------- util de log ----------
-def log(msg: str) -> None:
+def log(*args, **kwargs):
     ts = datetime.now().strftime("%H:%M:%S")
-    print(f"[{ts}] {msg}")
+    print(f"[{ts}]", *args, **kwargs)
 
+# -----------------------
+# build driver (undetected + selenium-wire)
+# -----------------------
+def build_driver():
+    chrome_opts = uc.ChromeOptions()
 
-# ---------- Navegador ----------
-def build_driver() -> webdriver.Chrome:
-    chrome_opts = Options()
-
-    # Headless
-    if HEADLESS in ("1", "true", "yes", "chrome", "on", ""):
-        # modo headless "clássico" do Chrome (mais compatível para console logs)
+    # headless logic
+    if HEADLESS in ("1", "true", "yes", "chrome", ""):
         chrome_opts.add_argument("--headless")
     elif HEADLESS == "new":
         chrome_opts.add_argument("--headless=new")
-    # HEADLESS "off": não adiciona headless (para testes locais)
+    # else HEADLESS == 'off' -> run headful (not for Render)
 
     chrome_opts.add_argument("--no-sandbox")
-    chrome_opts.add_argument("--disable-gpu")
     chrome_opts.add_argument("--disable-dev-shm-usage")
-    chrome_opts.add_argument("--disable-software-rasterizer")
-    chrome_opts.add_argument("--disable-extensions")
-    chrome_opts.add_argument("--mute-audio")
-    chrome_opts.add_argument("--disable-background-networking")
-    chrome_opts.add_argument("--disable-background-timer-throttling")
-    chrome_opts.add_argument("--disable-renderer-backgrounding")
-    chrome_opts.add_argument("--disable-ipc-flooding-protection")
-    chrome_opts.add_argument("--no-first-run")
-    chrome_opts.add_argument("--no-default-browser-check")
+    chrome_opts.add_argument("--disable-gpu")
     chrome_opts.add_argument("--window-size=1366,768")
-    # bloquear imagens pode destravar renderer em redes mais restritivas
     chrome_opts.add_argument("--blink-settings=imagesEnabled=false")
-
-    # Estratégia de carregamento: não esperar "complete"
-    chrome_opts.set_capability("pageLoadStrategy", "eager")
-
-    # Coleta de logs do console
-    chrome_opts.set_capability("goog:loggingPrefs", {"browser": "ALL"})
+    chrome_opts.add_argument("--disable-extensions")
+    chrome_opts.add_argument("--disable-background-networking")
+    chrome_opts.add_argument("--disable-features=VizDisplayCompositor")  # can help headless stability
 
     if USER_AGENT:
-        chrome_opts.add_argument(f"user-agent={USER_AGENT}")
+        chrome_opts.add_argument(f"--user-agent={USER_AGENT}")
 
-    # Perfil temporário único (evita "user data dir already in use")
-    user_data_dir = tempfile.mkdtemp(prefix="sel_profile_")
+    # temporary profile dir to avoid collisions
+    user_data_dir = tempfile.mkdtemp(prefix="uc_profile_")
     chrome_opts.add_argument(f"--user-data-dir={user_data_dir}")
 
-    # Proxy via selenium-wire (suporta socks5 e http)
-    sw_opts: Dict[str, Dict[str, str]] = {}
+    # selenium-wire options
+    sw_opts: Dict[str, Any] = {}
     if PROXY_URL:
-        sw_opts["proxy"] = {"http": PROXY_URL, "https": PROXY_URL}
+        # Selenium Wire accepts socks5 URLs. Use socks5h for proxy-side DNS resolution.
+        sw_opts["proxy"] = {
+            "http": PROXY_URL,
+            "https": PROXY_URL,
+            # optional: 'no_proxy': 'localhost,127.0.0.1'
+        }
 
-    driver = webdriver.Chrome(options=chrome_opts, seleniumwire_options=sw_opts)
+    # set port or any other sw_opts if needed
+    # create driver
+    driver = uc.Chrome(options=chrome_opts, seleniumwire_options=sw_opts)
     driver._user_data_dir = user_data_dir
 
-    # Timeout de carregamento menor – não ficar preso esperando terceiros
+    # minor timeouts
     driver.set_page_load_timeout(45)
 
-    # Desligar cache
+    # disable cache if possible via CDP
     try:
         driver.execute_cdp_cmd("Network.setCacheDisabled", {"cacheDisabled": True})
     except Exception:
         pass
 
-    if DEBUG_SOCKET:
-        # Log básico de requisições socket.io (XHR/polling)
-        def _request_interceptor(request):
-            if "/socket.io" in request.path:
-                log(f"[SOCK-REQ] {request.method} {request.path}")
-
-        driver.request_interceptor = _request_interceptor
-
-        def _response_interceptor(request, response):
-            if "/socket.io" in request.path:
-                log(f"[SOCK-RES] {response.status_code} {request.path}")
-
-        driver.response_interceptor = _response_interceptor
+    # Request interceptor example: add headers to a specific host if needed
+    # def req_interceptor(request):
+    #     if 'algum-host' in request.host:
+    #         request.headers['X-My'] = 'value'
+    # driver.request_interceptor = req_interceptor
 
     return driver
 
-
-# ---------- Supabase ----------
+# -----------------------
+# Supabase sender
+# -----------------------
 async def send_to_supabase(session: aiohttp.ClientSession, evt: Dict[str, Any]) -> None:
     if not SUPABASE_ROUNDS_URL:
         return
@@ -146,44 +123,56 @@ async def send_to_supabase(session: aiohttp.ClientSession, evt: Dict[str, Any]) 
         async with session.post(SUPABASE_ROUNDS_URL, headers=headers, json=payload) as resp:
             if DEBUG:
                 body = await resp.text()
-                log(f"[SUPABASE] {resp.status} {body[:200]}")
+                log("[SUPABASE]", resp.status, body[:200])
     except Exception as e:
-        log(f"[SUPABASE] erro ao enviar: {e}")
+        log("[SUPABASE] erro ao enviar:", e)
 
-
-# ---------- Estratégia (placeholder) ----------
-def apply_strategies(history: Deque[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    return []
-
-
-# ---------- Heartbeat ----------
-async def heartbeat(history: Deque[Dict[str, Any]], stop_evt: asyncio.Event) -> None:
-    last = -1
-    while not stop_evt.is_set():
-        await asyncio.sleep(HEARTBEAT_SECS)
-        counts = Counter([r.get("color") for r in history])
-        total = len(history)
-        if total != last or DEBUG:
-            last = total
-            log(f"[HEARTBEAT] rounds={total} red={counts.get('red',0)} "
-                f"black={counts.get('black',0)} white={counts.get('white',0)}")
-
-
-# ---------- Navegação robusta ----------
-def dom_ready_state(driver) -> str:
+# -----------------------
+# socket.io parser helper
+# -----------------------
+def parse_socketio_frames(text: str):
+    """
+    Recebe uma string (conteúdo WS/socket.io payload) e tenta extrair objetos
+    do tipo 42[ ... ] (socket.io event frames) e devolve lista de objetos.
+    """
+    results = []
+    if not text:
+        return results
+    # split on 42[ occurrences (socket.io)
     try:
-        return driver.execute_script("return document.readyState || ''") or ""
-    except WebDriverException:
-        return ""
+        parts = text.split("42[")
+        # parts[0] is prefix, others are JSON arrays like '"data", {...}]...'
+        for i in range(1, len(parts)):
+            chunk = "42[" + parts[i]  # restore beginning
+            try:
+                # remove leading '42' then parse JSON
+                raw = chunk[2:]
+                # raw may end with extra data; find matching bracket slice
+                # attempt to parse until closing bracket
+                # a simple approach: find last ']' in raw (works normally)
+                idx = raw.rfind("]")
+                if idx != -1:
+                    json_text = raw[:idx+1]
+                else:
+                    json_text = raw
+                arr = json.loads(json_text)
+                # arr[0] is event name, arr[1] body
+                results.append(arr)
+            except Exception:
+                # fallback: try parse whole chunk
+                try:
+                    arr = json.loads(parts[i])
+                    results.append(arr)
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return results
 
-
-def page_min_ready(driver) -> bool:
-    # consideramos ok se já chegou a 'interactive' (não precisa 'complete')
-    state = dom_ready_state(driver)
-    return state in ("interactive", "complete")
-
-
-async def run_loop() -> None:
+# -----------------------
+# main loop
+# -----------------------
+async def run_loop():
     history: Deque[Dict[str, Any]] = deque(maxlen=HISTORY_MAXLEN)
     stop_evt = asyncio.Event()
     timeout = aiohttp.ClientTimeout(total=None)
@@ -191,127 +180,132 @@ async def run_loop() -> None:
     async with aiohttp.ClientSession(timeout=timeout) as session:
         driver = build_driver()
 
-        hook_js = r"""
-        (() => {
-          const COLORS = { 1: "red", 0: "white", 2: "black" };
-          window.__emittedResults = window.__emittedResults || new Set();
-          function tryEmitResult(obj) {
-            if (!obj || !obj.id || !obj.payload) return false;
-            const isResult =
-              obj.id === "double.result" ||
-              obj.id === "double:result" ||
-              obj.id === "new:game_result" ||
-              (obj.id === "double.tick" &&
-               obj.payload && obj.payload.color != null && obj.payload.roll != null);
-            if (!isResult) return false;
-            const rid   = obj.payload?.id || null;
-            const color = COLORS[obj.payload?.color] ?? String(obj.payload?.color);
-            const roll  = obj.payload?.roll ?? null;
-            const at    = obj.payload?.created_at || obj.payload?.updated_at || null;
-            const key = `${rid}|${roll}|${at || ""}`;
-            if (window.__emittedResults.has(key)) return true;
-            window.__emittedResults.add(key);
-            console.log("__RESULT__" + JSON.stringify({ roundId: rid, color, roll, at }));
-            return true;
-          }
-          function parseSocketIoPacket(str) {
-            if (typeof str !== "string") return;
-            if (!str.startsWith("42")) return;
-            try {
-              const arr = JSON.parse(str.slice(2));
-              const ev = arr?.[0];
-              const body = arr?.[1];
-              if (ev === "data") tryEmitResult(body);
-            } catch(e){}
-          }
-          const _fetch = window.fetch;
-          window.fetch = async function(...args){
-            const res = await _fetch.apply(this, args);
-            try {
-              const url = (typeof args[0] === "string" ? args[0] : args[0]?.url) || "";
-              if (url.includes("/socket.io")){
-                const clone = res.clone();
-                clone.text().then(t=>{
-                  const parts = String(t||"").split("42[");
-                  for(let i=1;i<parts.length;i++) parseSocketIoPacket("42["+parts[i]);
-                }).catch(()=>{});
-              }
-            } catch(e){}
-            return res;
-          };
-          const _open = XMLHttpRequest.prototype.open;
-          const _send = XMLHttpRequest.prototype.send;
-          XMLHttpRequest.prototype.open = function(method, url, ...rest){
-            this.__isSock = url && url.includes && url.includes("/socket.io");
-            return _open.call(this, method, url, ...rest);
-          };
-          XMLHttpRequest.prototype.send = function(body){
-            if (this.__isSock){
-              this.addEventListener("load", function(){
-                try{
-                  const text = (this.responseType===""||this.responseType==="text") ? (this.responseText||"") : "";
-                  const parts = String(text||"").split("42[");
-                  for(let i=1;i<parts.length;i++) parseSocketIoPacket("42["+parts[i]);
-                }catch(e){}
-              });
-            }
-            return _send.call(this, body);
-          };
-          const OriginalWS = window.WebSocket;
-          window.WebSocket = function(url, protocols){
-            const ws = new OriginalWS(url, protocols);
-            ws.addEventListener("message", (evt) => {
-              if (typeof evt.data === "string") parseSocketIoPacket(evt.data);
-            });
-            return ws;
-          };
-        })();
-        """
-        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": hook_js})
-
-        # Navegação com tolerância a timeout do renderer
-        log(f"[NAV] indo para {GAME_URL}")
+        log("[NAV] indo para", GAME_URL)
         try:
             driver.get(GAME_URL)
         except TimeoutException:
-            log("[NAV] timeout do renderer (ignorado); verificando estado do DOM…")
+            log("[NAV] timeout do renderer (ignorado), tentando continuar")
         except Exception as e:
-            log(f"[NAV] erro ao navegar: {e}")
-            try:
-                driver.quit()
-            finally:
-                return
+            log("[NAV] erro ao navegar:", e)
+            driver.quit()
+            return
 
-        # Estado do DOM e título/URL após navegação
+        # logs básicos
         try:
-            log(f"[NAV] readyState={dom_ready_state(driver)}")
-            log(f"[NAV] title={driver.title!r}")
-            log(f"[NAV] url={driver.current_url}")
+            ready = driver.execute_script("return document.readyState")
+            log("[NAV] readyState=", ready)
+            log("[NAV] title=", driver.title)
+            log("[NAV] url=", driver.current_url)
         except Exception:
             pass
 
-        # Confere se ao menos chegou em 'interactive'; senão tenta recarga
-        try_count = 0
-        while not page_min_ready(driver) and try_count < 2:
-            try_count += 1
-            try:
-                driver.refresh()
-            except Exception:
-                pass
-            await asyncio.sleep(2)
-            log(f"[NAV] retry {try_count} - readyState={dom_ready_state(driver)}")
+        # heartbeat
+        async def heartbeat():
+            last_total = -1
+            while not stop_evt.is_set():
+                await asyncio.sleep(HEARTBEAT_SECS)
+                counts = Counter([r.get("color") for r in history])
+                total = len(history)
+                if total != last_total or DEBUG:
+                    last_total = total
+                    log("[HEARTBEAT] rounds=", total,
+                        "red=", counts.get("red", 0),
+                        "black=", counts.get("black", 0),
+                        "white=", counts.get("white", 0))
 
-        async def poll_console() -> None:
-            first_dump = True
+        # Poll websocket messages via selenium-wire (recommended)
+        async def poll_ws_requests():
+            # keep scanning driver.requests for websocket handshake requests that have ws_messages
+            seen_req_ids = set()
             while not stop_evt.is_set():
                 try:
-                    logs = driver.get_log("browser")
-                    # Dump inicial de algumas mensagens para diagnóstico
-                    if first_dump and logs:
-                        first_dump = False
-                        log("[CONSOLE] amostra inicial:")
+                    # driver.requests is a snapshot-like collection; iterate recent
+                    for req in list(driver.requests):
+                        # only consider websocket handshake or socket.io endpoints
+                        url = getattr(req, "url", "") or ""
+                        if "/socket.io" not in url and not url.startswith("wss://"):
+                            continue
+                        # skip if already processed
+                        rid = getattr(req, "id", None) or url
+                        if rid in seen_req_ids:
+                            # still can have new ws_messages on same req; we won't skip
+                            pass
+                        # ws_messages attribute holds messages for websocket handshake requests
+                        ws_msgs = getattr(req, "ws_messages", None)
+                        if not ws_msgs:
+                            continue
+                        # iterate messages
+                        for m in ws_msgs:
+                            # m.content may be bytes or str
+                            content = m.content
+                            if isinstance(content, bytes):
+                                try:
+                                    content = content.decode("utf-8", errors="ignore")
+                                except Exception:
+                                    content = str(content)
+                            # parse socket.io frames inside content
+                            frames = parse_socketio_frames(str(content))
+                            for frame in frames:
+                                try:
+                                    ev_name = frame[0]
+                                    body = frame[1] if len(frame) > 1 else None
+                                    # if body structure matches payload => extract
+                                    if isinstance(body, dict):
+                                        payload = body
+                                        # try to map fields
+                                        rid = payload.get("id") or payload.get("roundId") or None
+                                        color_val = payload.get("color")
+                                        roll = payload.get("roll")
+                                        # normalize color mapping if numeric
+                                        color = None
+                                        if isinstance(color_val, int):
+                                            color = {1: "red", 2: "black", 0: "white"}.get(color_val, str(color_val))
+                                        else:
+                                            color = str(color_val) if color_val is not None else None
+                                        at = payload.get("created_at") or payload.get("updated_at") or payload.get("at") or datetime.now(timezone.utc).isoformat()
+                                        if rid is None and roll is None:
+                                            # not the payload we want
+                                            continue
+                                        evt = {"roundId": rid, "color": color, "roll": roll, "at": at}
+                                        key = f"{evt.get('roundId')}|{evt.get('roll')}|{evt.get('at')}"
+                                        if key in _DEDUPE:
+                                            continue
+                                        _DEDUPE.add(key)
+                                        if len(_DEDUPE) > _DEDUPE_MAX:
+                                            _DEDUPE.clear()
+                                            _DEDUPE.add(key)
+                                        log("[WS-RESULT]", evt)
+                                        history.append(evt)
+                                        # async send to supabase
+                                        asyncio.create_task(send_to_supabase(session, evt))
+                                except Exception as e:
+                                    if DEBUG:
+                                        log("[WS-PARSE-ERR]", e)
+                        # mark seen
+                        seen_req_ids.add(rid)
+                    # small sleep to avoid busy loop
+                    await asyncio.sleep(0.8)
+                except Exception as e:
+                    if DEBUG:
+                        log("[POLL_WS ERR]", e)
+                    await asyncio.sleep(1.5)
+
+        # fallback: poll browser console for __RESULT__ messages
+        async def poll_console():
+            first = True
+            while not stop_evt.is_set():
+                try:
+                    logs = []
+                    try:
+                        logs = driver.get_log("browser")
+                    except Exception:
+                        # headless new may not present console logs in the same way
+                        pass
+                    if first and logs:
+                        first = False
+                        log("[CONSOLE] sample:")
                         for entry in logs[:5]:
-                            log(f"    {entry}")
+                            log("  ", entry)
                     for entry in logs:
                         msg = entry.get("message", "")
                         if "__RESULT__" not in msg:
@@ -330,37 +324,39 @@ async def run_loop() -> None:
                             _DEDUPE.add(key)
                         if not evt.get("at"):
                             evt["at"] = datetime.now(timezone.utc).isoformat()
-                        log(f"[RESULT] {evt['roundId']} -> {evt['color'].upper()} "
-                            f"({evt['roll']}) @ {evt['at']}")
+                        log("[CONSOLE-RESULT]", evt)
                         history.append(evt)
-                        await send_to_supabase(session, evt)
-                        _ = apply_strategies(history)
+                        asyncio.create_task(send_to_supabase(session, evt))
                 except Exception as e:
-                    # Em headless + proxy, leitura de log pode falhar esporadicamente
                     if DEBUG:
-                        log(f"[CONSOLE] erro ao ler logs: {e}")
+                        log("[CONSOLE POLL ERR]", e)
                 await asyncio.sleep(1.2)
 
-        hb_task = asyncio.create_task(heartbeat(history, stop_evt))
-        poll_task = asyncio.create_task(poll_console())
-        log("Coletando RESULTADOS… (Ctrl+C para sair)")
+        # start tasks
+        hb = asyncio.create_task(heartbeat())
+        ws_task = asyncio.create_task(poll_ws_requests())
+        console_task = asyncio.create_task(poll_console())
+
+        log("Coletando RESULTADOS... (rodando headless)")
+
         try:
+            # rodar indefinidamente; Render container mantem isso vivo
             await asyncio.Event().wait()
         except (asyncio.CancelledError, KeyboardInterrupt):
             pass
         finally:
             stop_evt.set()
-            hb_task.cancel()
-            poll_task.cancel()
+            for t in (hb, ws_task, console_task):
+                t.cancel()
             try:
                 driver.quit()
-            finally:
-                if hasattr(driver, "_user_data_dir"):
-                    try:
-                        shutil.rmtree(driver._user_data_dir)
-                    except Exception:
-                        pass
-
+            except Exception:
+                pass
+            if hasattr(driver, "_user_data_dir"):
+                try:
+                    shutil.rmtree(driver._user_data_dir)
+                except Exception:
+                    pass
 
 if __name__ == "__main__":
     try:
