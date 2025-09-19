@@ -2,8 +2,10 @@ requests
 python-dotenv==1.0.1
 aiohttp==3.9.1
 selenium-wire==5.1.0
+# selenium-wire depende de blinker._saferef, removido nas versões 1.8.x; por isso fixamos uma versão <1.8.
+blinker<1.8.0
 # Pin to a non-yanked version of undetected-chromedriver. Version 3.3.1 was
 # yanked from PyPI and causes build failures. The latest available version
-# as of Feb 17, 2024 is 3.5.5:contentReference[oaicite:2]{index=2}, which is compatible with
-# Selenium 4.9+:contentReference[oaicite:3]{index=3}. This pin restores installability.
+# as of Feb 17, 2024 is 3.5.5:contentReference[oaicite:1]{index=1}, which is compatible with
+# Selenium 4.9+:contentReference[oaicite:2]{index=2}. This pin restores installability.
 undetected-chromedriver==3.5.5
