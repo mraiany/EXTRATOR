@@ -4,10 +4,10 @@ extrator.py - Extrator de rodadas usando Selenium + SeleniumWire
 Suporta proxy HTTP ou SOCKS5 (via selenium-wire), captura eventos pelo console,
 envia para o Supabase e registra heartbeat.
 
-Principais mudanças:
-- REMOVIDO --user-data-dir (era a origem do erro "user data directory is already in use")
-- Flags extras para estabilidade em headless (--remote-debugging-port=0, etc.)
-- Habilitação explícita de logs de console (goog:loggingPrefs)
+Mudanças principais:
+- Sem --user-data-dir (remove o erro "user data directory is already in use")
+- Habilita logs de console via options.set_capability("goog:loggingPrefs", ...)
+- Proxy via selenium-wire (http/https/socks5)
 """
 
 import os
@@ -19,9 +19,8 @@ from collections import deque, Counter
 from typing import Deque, Dict, List, Any
 
 import aiohttp
-from seleniumwire import webdriver   # pip install selenium-wire
+from seleniumwire import webdriver          # pip install selenium-wire
 from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.desired_capabilities import DesiredCapabilities
 
 # ==================== Configs via env ====================
 GAME_URL = os.getenv("GAME_URL", "https://blaze.bet.br/pt/games/double")
@@ -38,7 +37,7 @@ _DEDUPE_MAX = 4000
 
 
 def _kill_zombie_chrome():
-    """(Opcional) tenta encerrar chromes zumbis antes de subir um novo."""
+    """(Opcional) encerra chromes zumbis antes de subir um novo."""
     try:
         subprocess.run(["pkill", "-f", "chrome"], check=False)
     except Exception:
@@ -53,7 +52,7 @@ def build_driver() -> webdriver.Chrome:
     _kill_zombie_chrome()
 
     opts = Options()
-    opts.headless = True
+    opts.add_argument("--headless=new")   # headless estável
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-gpu")
     opts.add_argument("--disable-dev-shm-usage")
@@ -64,33 +63,25 @@ def build_driver() -> webdriver.Chrome:
     opts.add_argument("--disable-background-timer-throttling")
     opts.add_argument("--disable-renderer-backgrounding")
     opts.add_argument("--disable-ipc-flooding-protection")
-    # evita conflitos com porta de devtools
     opts.add_argument("--remote-debugging-port=0")
-    # algumas otimizações extras
     opts.add_argument("--disable-features=Translate,BackForwardCache,AvoidUnnecessaryBeforeUnloadCheckSync")
 
     if USER_AGENT:
         opts.add_argument(f"user-agent={USER_AGENT}")
 
-    # Habilita logs de console (necessário para driver.get_log("browser"))
-    caps = DesiredCapabilities.CHROME.copy()
-    caps["goog:loggingPrefs"] = {"browser": "ALL"}
+    # Habilita logs de console (substitui desired_capabilities)
+    opts.set_capability("goog:loggingPrefs", {"browser": "ALL"})
 
     # Proxy via selenium-wire (HTTP/HTTPS/SOCKS5)
     seleniumwire_options: Dict[str, Any] = {}
     if PROXY_URL:
-        # aceita 'socks5://user:pass@ip:porta' ou 'http://user:pass@ip:porta'
         seleniumwire_options["proxy"] = {
             "http": PROXY_URL,
             "https": PROXY_URL,
             "no_proxy": "localhost,127.0.0.1",
         }
 
-    driver = webdriver.Chrome(
-        options=opts,
-        desired_capabilities=caps,
-        seleniumwire_options=seleniumwire_options,
-    )
+    driver = webdriver.Chrome(options=opts, seleniumwire_options=seleniumwire_options)
     driver.set_script_timeout(60)
     return driver
 
@@ -280,13 +271,9 @@ async def run_loop() -> None:
                         if not evt.get("at"):
                             evt["at"] = datetime.now(timezone.utc).isoformat()
 
-                        # log e buffer
                         print(f"[RESULT] {evt['roundId']} -> {evt['color'].upper()} ({evt['roll']}) @ {evt['at']}")
                         history.append(evt)
-
-                        # envia
                         await send_to_supabase(session, evt)
-                        # sua estratégia (se quiser)
                         _ = apply_strategies(history)
 
                 except Exception as e:
